@@ -7,7 +7,7 @@
 import { useState, useEffect } from "react";
 import { createRoot } from "react-dom/client";
 import ActFromHere from "./act-from-here.jsx";
-import { STORE_KEY, migrate, serialize, seed, clampSavedAt } from "./model.js";
+import { STORE_KEY, migrate, serialize, seed, clampSavedAt, looksLikeState } from "./model.js";
 import { applySeed } from "./seed-big-ticket.js";
 
 // AFH2 owns its own keys. Both apps share this origin's localStorage, and the
@@ -25,6 +25,7 @@ const LEGACY_DATA_KEY = "afh-v1";        // read once, never written
 const LEGACY_META_KEY = "afh-meta";
 const PUSH_DEBOUNCE = 2500;
 const NET_TIMEOUT = 4000;
+const MAX_PUSH_BYTES = 900000; // GitHub truncates gist file content above ~1 MB
 
 const now = () => Date.now();
 const getMeta = () => {
@@ -41,16 +42,24 @@ const flushApp = () => { try { window.dispatchEvent(new Event("afh:flush")); } c
 export const sync = {
   status: "off",            // off | ok | pending | error | pulling
   lastError: "",
-  lastPushedAt: 0,
   listeners: new Set(),
   timer: null,
-  inFlight: false,
-  queued: false,
-  opInFlight: false,        // one adoption at a time (save keys / pull / visible)
+  op: null,                 // promise chain: pushes and adoptions never interleave
+};
+// Every network operation that reads or writes the gist runs through here, one
+// at a time, so a push can never land between an adoption's pull and its
+// meta comparison (which would defeat the conflict stash). Callers get the
+// real result of their own operation.
+const serial = (fn) => {
+  const run = () => fn();
+  const p = (sync.op || Promise.resolve()).then(run, run);
+  sync.op = p.catch(() => {});
+  return p;
 };
 const emit = () => sync.listeners.forEach((fn) => fn());
 const setStatus = (s, err) => { sync.status = s; sync.lastError = err || ""; emit(); };
 const ghHeaders = (token) => ({ Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "Content-Type": "application/json" });
+const isAbort = (e) => e && (e.name === "AbortError" || /abort/i.test(String(e.message || "")));
 const withTimeout = (ms) => {
   const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
   const t = ctrl ? setTimeout(() => ctrl.abort(), ms) : null;
@@ -61,11 +70,16 @@ export async function findOrCreateGist(token, signal) {
   let id = localStorage.getItem(K_GIST_ID);
   if (id) return id;
   const listMine = async () => {
-    const list = await fetch("https://api.github.com/gists?per_page=100", { headers: ghHeaders(token), signal });
-    if (list.status === 401) throw new Error("token rejected (401)");
-    if (!list.ok) throw new Error(`gist list failed (${list.status})`); // never fall through and create a duplicate
-    const gists = await list.json();
-    return gists.filter((g) => g.description === GIST_DESC && g.files && g.files[GIST_FILE]).sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
+    const found = [];
+    for (let page = 1; page <= 10; page++) {
+      const list = await fetch(`https://api.github.com/gists?per_page=100&page=${page}`, { headers: ghHeaders(token), signal });
+      if (list.status === 401) throw new Error("token rejected (401)");
+      if (!list.ok) throw new Error(`gist list failed (${list.status})`); // never fall through and create a duplicate
+      const gists = await list.json();
+      found.push(...gists.filter((g) => g.description === GIST_DESC && g.files && g.files[GIST_FILE]));
+      if (!Array.isArray(gists) || gists.length < 100) break;
+    }
+    return found.sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
   };
   const mine = await listMine();
   if (mine.length) { localStorage.setItem(K_GIST_ID, mine[0].id); return mine[0].id; }
@@ -90,17 +104,18 @@ export async function findOrCreateGist(token, signal) {
   return g.id;
 }
 
-export async function pushToGist() {
+export const pushToGist = () => serial(pushNow);
+async function pushNow() {
   const token = localStorage.getItem(K_GH_TOKEN);
   if (!token) { setStatus("off"); return; }
-  if (sync.inFlight) { sync.queued = true; return; }
-  sync.inFlight = true;
+  const m = getMeta();
+  if (m.savedAt <= m.pushedAt) { if (sync.status !== "error") setStatus("ok"); return; } // nothing stranded (also dedupes hidden+pagehide)
   setStatus("pending");
   try {
-    const id = await findOrCreateGist(token);
-    const payload = { savedAt: getMeta().savedAt, data: localStorage.getItem(DATA_KEY) };
+    const payload = { savedAt: m.savedAt, data: localStorage.getItem(DATA_KEY) };
     const body = JSON.stringify({ files: { [GIST_FILE]: { content: JSON.stringify(payload) } } });
-    const res = await fetch(`https://api.github.com/gists/${id}`, {
+    if (body.length > MAX_PUSH_BYTES) throw new Error("data too large to sync (>900 KB) — export a backup and clear done items");
+    const patch = async () => fetch(`https://api.github.com/gists/${await findOrCreateGist(token)}`, {
       method: "PATCH",
       headers: ghHeaders(token),
       body,
@@ -108,16 +123,14 @@ export async function pushToGist() {
       // browsers cap keepalive bodies (~64KB) — fall back for oversized states
       keepalive: body.length < 60000,
     });
+    let res = await patch();
+    if (res.status === 404) { localStorage.removeItem(K_GIST_ID); res = await patch(); } // cached id points at a deleted gist
     if (!res.ok) throw new Error(`push failed (${res.status})`);
-    sync.lastPushedAt = payload.savedAt;
     setMeta({ ...getMeta(), pushedAt: payload.savedAt });
     setStatus("ok");
   } catch (e) {
     console.error("gist push:", e);
     setStatus("error", String(e.message || e));
-  } finally {
-    sync.inFlight = false;
-    if (sync.queued) { sync.queued = false; pushToGist(); }
   }
 }
 
@@ -134,11 +147,14 @@ export async function pullFromGist({ timeoutMs = NET_TIMEOUT } = {}) {
   if (!token) return null;
   const t = withTimeout(timeoutMs);
   try {
-    const id = await findOrCreateGist(token, t.signal);
-    const res = await fetch(`https://api.github.com/gists/${id}`, { headers: ghHeaders(token), signal: t.signal });
+    const get = async () => fetch(`https://api.github.com/gists/${await findOrCreateGist(token, t.signal)}`, { headers: ghHeaders(token), signal: t.signal });
+    let res = await get();
+    if (res.status === 404) { localStorage.removeItem(K_GIST_ID); res = await get(); } // cached id points at a deleted gist
     if (!res.ok) throw new Error(`pull failed (${res.status})`);
     const g = await res.json();
-    const raw = g.files && g.files[GIST_FILE] && g.files[GIST_FILE].content;
+    const file = g.files && g.files[GIST_FILE];
+    if (file && file.truncated) throw new Error("gist too large to sync — export a backup and clear done items");
+    const raw = file && file.content;
     if (!raw) return null;
     const parsed = JSON.parse(raw);
     if (!parsed || typeof parsed !== "object") return null;
@@ -151,19 +167,22 @@ export async function pullFromGist({ timeoutMs = NET_TIMEOUT } = {}) {
 // Adopt remote if strictly newer than local. Returns true if adopted (caller
 // decides whether to reload). Remote data is run through migrate+serialize
 // first — a hostile or truncated gist is refused, never written.
-export async function adoptRemoteIfNewer() {
-  if (sync.opInFlight) return false;
-  sync.opInFlight = true;
+export const adoptRemoteIfNewer = () => serial(adoptNow);
+async function adoptNow() {
   try {
     const remote = await pullFromGist();
+    // Land anything the user typed DURING the pull before comparing — otherwise
+    // an edit made in that window is overwritten by the adoption and lost.
+    flushApp();
     const m = getMeta();
     if (remote && remote.data && remote.savedAt > m.savedAt) {
-      const clean = serialize(migrate(JSON.parse(remote.data)));
+      const parsed = JSON.parse(remote.data);
+      if (!looksLikeState(parsed)) throw new Error("remote data unrecognized — not adopted");
+      const clean = serialize(migrate(parsed));
       const local = localStorage.getItem(DATA_KEY);
       if (local === clean) {
         // same content, newer stamp — align meta, no reload needed
         setMeta({ savedAt: remote.savedAt, pushedAt: remote.savedAt });
-        sync.lastPushedAt = remote.savedAt;
         setStatus("ok");
         return false;
       }
@@ -174,7 +193,6 @@ export async function adoptRemoteIfNewer() {
       }
       localStorage.setItem(DATA_KEY, clean);
       setMeta({ savedAt: remote.savedAt, pushedAt: remote.savedAt });
-      sync.lastPushedAt = remote.savedAt;
       setStatus("ok");
       return true;
     }
@@ -182,10 +200,8 @@ export async function adoptRemoteIfNewer() {
     return false;
   } catch (e) {
     console.error("gist pull:", e);
-    setStatus("error", String(e.message || e));
+    setStatus("error", isAbort(e) ? "timed out reaching GitHub" : String(e.message || e));
     return false;
-  } finally {
-    sync.opInFlight = false;
   }
 }
 
@@ -211,11 +227,14 @@ export function installStorageAdapter() {
       if (v === null) throw new Error(`key not found: ${key}`);
       return { key, value: v, shared: false };
     },
-    async set(key, value) {
+    // opts.touch === false → write the bytes only (canonical re-serialization on
+    // load); the watermark and the push schedule are left alone, because the
+    // user didn't edit anything and a fresh stamp could outrank real edits elsewhere.
+    async set(key, value, opts) {
       if (window.storage.frozen) return { key, value, shared: false, frozen: true };
       const existedBefore = key !== DATA_KEY || localStorage.getItem(DATA_KEY) !== null;
       localStorage.setItem(key, value);
-      if (key === DATA_KEY) {
+      if (key === DATA_KEY && !(opts && opts.touch === false && existedBefore)) {
         if (!existedBefore) {
           setMeta({ savedAt: 1, pushedAt: 1 });
         } else {
@@ -276,7 +295,7 @@ const download = (name, text) => {
   a.href = URL.createObjectURL(blob);
   a.download = name;
   a.click();
-  URL.revokeObjectURL(a.href);
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000); // Safari/Firefox can cancel the download if revoked synchronously
 };
 
 export function exportBackup() {
@@ -294,11 +313,12 @@ export function importBackup(text) {
   const raw = payload && typeof payload.data === "string" ? payload.data : JSON.stringify(payload);
   let state;
   try { state = JSON.parse(raw); } catch { throw new Error("not valid JSON"); }
-  if (!state || typeof state !== "object" || (!state.items && !state.week)) throw new Error("doesn't look like Act From Here data");
+  if (!looksLikeState(state)) throw new Error("doesn't look like Act From Here data");
   const clean = serialize(applySeed(migrate(state)));
   flushApp();
-  window.storage.frozen = true;
-  localStorage.setItem(DATA_KEY, clean);
+  try { localStorage.setItem(DATA_KEY, clean); }
+  catch (e) { throw new Error("couldn't store the backup (" + ((e && e.name) || e) + ")"); }
+  window.storage.frozen = true; // only once the write landed — the caller reloads next
   setMeta({ savedAt: now(), pushedAt: 0 }); // an explicit user action = real data; pushes on reload
   return true;
 }
@@ -383,6 +403,8 @@ function SyncPanel() {
     return () => sync.listeners.delete(fn);
   }, []);
 
+  const msgTimer = { current: null };
+  const say = (m, ms) => { setMsg(m); if (msgTimer.current) clearTimeout(msgTimer.current); if (ms) msgTimer.current = setTimeout(() => setMsg(""), ms); };
   const saveKeys = async () => {
     const a = anthropicKey.trim();
     const g = ghToken.trim();
@@ -390,16 +412,15 @@ function SyncPanel() {
     const prev = localStorage.getItem(K_GH_TOKEN) || "";
     if (g) localStorage.setItem(K_GH_TOKEN, g); else { localStorage.removeItem(K_GH_TOKEN); localStorage.removeItem(K_GIST_ID); setStatus("off"); }
     if (g && g !== prev) localStorage.removeItem(K_GIST_ID); // a different token may be a different account
-    setMsg("saved on this device");
+    say("saved on this device", 2500);
     if (g && g !== prev) {
       // new token on this device: adopt remote if it's ahead, else push what we have
-      setMsg("connecting to gist…");
+      say("connecting to gist…");
       const adopted = await adoptAndReload();
       if (adopted) return;
-      pushToGist();
-      setMsg(sync.status === "error" ? "gist error — see status above" : "gist connected");
+      await pushToGist();
+      say(sync.status === "error" ? "gist error — see status above" : "gist connected", 2500);
     }
-    setTimeout(() => setMsg(""), 2500);
   };
 
   const onImportFile = (e) => {
@@ -408,7 +429,7 @@ function SyncPanel() {
     const r = new FileReader();
     r.onload = () => {
       try { importBackup(String(r.result)); location.reload(); }
-      catch (err) { setMsg("import failed: " + err.message); setTimeout(() => setMsg(""), 4000); }
+      catch (err) { say("import failed: " + err.message, 4000); }
     };
     r.readAsText(f);
     e.target.value = "";
@@ -529,6 +550,7 @@ export async function boot(mountNode) {
   // leaving: best-effort final push of anything pending
   window.addEventListener("pagehide", () => {
     flushApp();
+    if (sync.timer) { clearTimeout(sync.timer); sync.timer = null; }
     const m = getMeta();
     if (localStorage.getItem(K_GH_TOKEN) && m.savedAt > m.pushedAt) pushToGist();
   });

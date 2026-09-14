@@ -42,7 +42,7 @@ export const KEY_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/i;
 const CAP = { text: 2000, next: 2000, url: 2048, name: 80, label: 80 };
 
 export const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
-const has = (o, k) => o != null && typeof o === "object" && Object.prototype.hasOwnProperty.call(o, k);
+export const has = (o, k) => o != null && typeof o === "object" && Object.prototype.hasOwnProperty.call(o, k);
 const str = (v, cap) => {
   if (v == null) return "";
   const s = typeof v === "string" ? v : typeof v === "number" || typeof v === "boolean" ? String(v) : (() => { try { return JSON.stringify(v); } catch (e) { return ""; } })();
@@ -77,17 +77,25 @@ export const safeHref = (url) => {
 };
 
 // A crafted/corrupt timestamp would win last-write-wins forever. Accept only a
-// safe non-negative integer no further than 5 minutes into the future.
+// safe non-negative integer no further than a day into the future (the threat
+// is absurd values like MAX_SAFE_INTEGER, not a phone whose clock runs fast).
 export const clampSavedAt = (x) => {
   if (typeof x !== "number" || !Number.isSafeInteger(x) || x < 0) return null;
-  if (x > Date.now() + 5 * 60 * 1000) return null;
+  if (x > Date.now() + 24 * 60 * 60 * 1000) return null;
   return x;
 };
+
+// Shape gate for anything arriving from the network or a file. migrate() is
+// deliberately lossless and turns garbage into an empty default state — which
+// must never be allowed to replace real data.
+export const looksLikeState = (x) =>
+  !!x && typeof x === "object" && !Array.isArray(x) &&
+  (Array.isArray(x.sections) || (has(x, "items") && !!x.items && typeof x.items === "object") || Array.isArray(x.week));
 
 // ---------- sanitizers ----------
 const sanitizeKey = (raw, taken) => {
   const k = typeof raw === "string" ? raw : "";
-  const ok = KEY_RE.test(k) && !taken.has(k.toLowerCase());
+  const ok = KEY_RE.test(k) && !(k in Object.prototype) && !taken.has(k.toLowerCase());
   const key = ok ? k : "s" + uid() + Math.random().toString(36).slice(2, 4);
   taken.add(key.toLowerCase());
   return key;

@@ -175,7 +175,7 @@ test("clampSavedAt rejects unsafe, negative, non-number and far-future values", 
   assert.equal(clampSavedAt(0), 0);
   assert.equal(clampSavedAt(1), 1);
   assert.equal(clampSavedAt(9007199254740991), null);
-  assert.equal(clampSavedAt(now + 60 * 60 * 1000), null);
+  assert.equal(clampSavedAt(now + 48 * 60 * 60 * 1000), null);
   assert.equal(clampSavedAt(-5), null);
   assert.equal(clampSavedAt("123"), null);
   assert.equal(clampSavedAt(NaN), null);
@@ -185,4 +185,30 @@ test("clampSavedAt rejects unsafe, negative, non-number and far-future values", 
 test("firstGrapheme returns one grapheme cluster", () => {
   assert.equal(firstGrapheme("❤️‍🔥ab"), "❤️‍🔥");
   assert.equal(firstGrapheme(""), "");
+});
+
+import { looksLikeState } from "../src/model.js";
+
+test("migrate remaps Object.prototype property names used as keys", () => {
+  const raw = v3();
+  raw.sections.push({ key: "constructor", glyph: "c" }, { key: "toString", glyph: "t" });
+  raw.items.constructor = [{ id: "k1", text: "in constructor bucket", done: false }];
+  raw.collapsed = { constructor: true };
+  const out = migrate(raw);
+  for (const s of out.sections) assert.ok(!(s.key in Object.prototype), s.key + " must not be a prototype property");
+  assert.ok(Object.values(out.items).flat().some((i) => i.text === "in constructor bucket"));
+  assert.ok(!Object.keys(out.collapsed).some((k) => k in Object.prototype));
+});
+
+test("looksLikeState accepts v1-v4 shapes and rejects degenerate payloads", () => {
+  assert.equal(looksLikeState(migrate(v3())), true);
+  assert.equal(looksLikeState({ items: {} }), true);
+  assert.equal(looksLikeState({ week: [] }), true);
+  for (const bad of [null, {}, [], 42, "hi", { foo: 1 }, { sections: "x" }]) assert.equal(looksLikeState(bad), false, JSON.stringify(bad));
+});
+
+test("clampSavedAt tolerates a day of clock skew but not more", () => {
+  const now = Date.now();
+  assert.equal(clampSavedAt(now + 6 * 60 * 60 * 1000), now + 6 * 60 * 60 * 1000);
+  assert.equal(clampSavedAt(now + 25 * 60 * 60 * 1000), null);
 });

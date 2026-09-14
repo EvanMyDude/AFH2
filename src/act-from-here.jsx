@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import {
-  DEFAULT_SECTIONS, SECTION_META, SORT_HINTS, MAX_SECTIONS, STORE_KEY, CORRUPT_KEY,
-  uid, firstGrapheme, migrate, serialize, seed, catchAllKey, safeHref,
+  SECTION_META, SORT_HINTS, MAX_SECTIONS, STORE_KEY, CORRUPT_KEY,
+  uid, firstGrapheme, migrate, serialize, seed, catchAllKey, safeHref, has,
 } from "./model.js";
 import { applySeed } from "./seed-big-ticket.js";
 
@@ -20,10 +20,8 @@ const C = {
 };
 
 const CLICK_DELAY = 220; // ms window separating single click (expand) from double click (edit)
-const has = (o, k) => o != null && typeof o === "object" && Object.prototype.hasOwnProperty.call(o, k);
 const metaLabel = (key) => (has(SECTION_META, key) ? SECTION_META[key].label : "UNTITLED");
 const metaHint = (key) => (has(SECTION_META, key) ? SECTION_META[key].hint : "nothing here yet");
-export { migrate, firstGrapheme };
 
 // Hover-reveal on pointer devices, always visible (dimmed) on touch. Tailwind's
 // hoverOnlyWhenSupported wraps group-hover in (hover:hover) and (pointer:fine),
@@ -65,6 +63,17 @@ export default function ActFromHere() {
   const [newSubName, setNewSubName] = useState("");
   const [editingSub, setEditingSub] = useState(null); // { sec, key, value }
   const [pendingDeleteSub, setPendingDeleteSub] = useState(null); // { sec, key }
+  // Refs mirror the transient form state and are cleared SYNCHRONOUSLY in every
+  // close path. Chrome fires blur on an input that is removed while focused,
+  // and React dispatches that stale onBlur with the previous render's closure —
+  // without these guards, Esc could still commit and Enter could double-add.
+  const editingRef = useRef(null);
+  const editingCatRef = useRef(null);
+  const editingGlyphRef = useRef(null);
+  const editingSubRef = useRef(null);
+  const addingRef = useRef(null);
+  const addingSubRef = useRef(null);
+  const onFlushRef = useRef(null);
   const addItemInputRef = useRef(null);
   const toastTimer = useRef(null);
   const latest = useRef(null);     // newest state, source of truth for writes AND mutations
@@ -99,7 +108,10 @@ export default function ActFromHere() {
         const migrated = migrate(JSON.parse(res.value));
         latest.current = migrated;
         setData(migrated);
-        if (serialize(migrated) !== res.value) scheduleSave(); // persist the canonical shape via the writer
+        const canonical = serialize(migrated);
+        // Persist the canonical shape WITHOUT touching the watermark — nothing was
+        // edited, and a fresh timestamp could outrank real edits on another device.
+        if (canonical !== res.value) window.storage.set(STORE_KEY, canonical, { touch: false }).catch((e) => console.error("canonical rewrite", e));
       } catch (e) {
         console.error("load failed", e);
         try { localStorage.setItem(CORRUPT_KEY, String(res.value)); } catch (e2) { /* quota — nothing else to do */ }
@@ -132,8 +144,6 @@ export default function ActFromHere() {
     if (ok) {
       setSaveState("saved");
       setTimeout(() => setSaveState((s) => (s === "saved" ? "" : s)), 1200);
-    } else {
-      setSaveState("error");
     }
   };
 
@@ -207,11 +217,13 @@ export default function ActFromHere() {
   // ---------- quick add (per section or subsection) ----------
   // Enter commits and keeps the form open for rapid consecutive entry;
   // tapping away commits and closes; Esc discards; empty text creates nothing.
-  const closeNewItem = () => { setAddingItem(null); setNewItem({ text: "", url: "" }); };
+  const openNewItem = (sec, sub) => { addingRef.current = { sec, sub }; setAddingItem({ sec, sub }); setNewItem({ text: "", url: "" }); };
+  const closeNewItem = () => { addingRef.current = null; setAddingItem(null); setNewItem({ text: "", url: "" }); };
 
   const commitNewItem = (keepOpen) => {
-    if (!addingItem) return;
-    const { sec: secKey, sub } = addingItem;
+    const form = addingRef.current;
+    if (!form) return; // already closed (Esc / committed) — a stale blur must not add again
+    const { sec: secKey, sub } = form;
     const text = newItem.text.trim();
     const url = newItem.url.trim();
     if (!text) { if (!keepOpen) closeNewItem(); return; }
@@ -241,33 +253,42 @@ export default function ActFromHere() {
   // ---------- collapse ----------
   // Bodies never unmount (smooth animation), so transient state inside a
   // collapsing section must be cleared by hand.
+  // Collapsing is "tapping away": open forms inside the collapsing scope are
+  // COMMITTED (never discarded). Scope = the section, or just one subsection.
   const clearTransient = (secKey, subKey) => {
-    const inScope = (s) => s === secKey && (subKey == null || true);
-    if (editing && inScope(editing.sec)) setEditing(null);
-    if (addingItem && addingItem.sec === secKey && (subKey == null || addingItem.sub === subKey)) closeNewItem();
+    const st = cur();
+    const inScope = (sec, sub) => sec === secKey && (subKey == null || (sub || null) === subKey);
+    const e = editingRef.current;
+    if (e && e.sec === secKey) {
+      const it = (st.items[secKey] || []).find((i) => i.id === e.id);
+      if (inScope(secKey, it && it.sub)) commitItemEdit();
+    }
+    const a = addingRef.current;
+    if (a && inScope(a.sec, a.sub)) commitNewItem(false);
+    const r = editingSubRef.current;
+    if (r && r.sec === secKey && (subKey == null || r.key === subKey)) commitSubRename();
     if (openItem) {
-      const st = cur();
       const it = (st.items[secKey] || []).find((i) => i.id === openItem);
-      if (it && (subKey == null || it.sub === subKey)) setOpenItem(null);
+      if (it && inScope(secKey, it.sub)) setOpenItem(null);
     }
     if (clickTimer.current) { clearTimeout(clickTimer.current); clickTimer.current = null; }
   };
 
   const toggleCollapse = (key) => {
-    const st = cur();
-    const collapsing = !st.collapsed[key];
+    const collapsing = !cur().collapsed[key];
     if (collapsing) clearTransient(key, null);
+    const st = cur(); // AFTER the commits above
     const collapsed = { ...st.collapsed };
     if (collapsing) collapsed[key] = true; else delete collapsed[key];
     persist({ ...st, collapsed });
   };
 
   const toggleSub = (secKey, subKey) => {
-    const st = cur();
-    const sec = st.sections.find((s) => s.key === secKey);
-    const sub = sec && sec.subs.find((x) => x.key === subKey);
-    if (!sub) return;
-    if (!sub.collapsed) clearTransient(secKey, subKey);
+    const sec0 = cur().sections.find((s) => s.key === secKey);
+    const sub0 = sec0 && sec0.subs.find((x) => x.key === subKey);
+    if (!sub0) return;
+    if (!sub0.collapsed) clearTransient(secKey, subKey);
+    const st = cur(); // AFTER the commits above
     persist({
       ...st,
       sections: st.sections.map((s) => (s.key !== secKey ? s : {
@@ -278,12 +299,13 @@ export default function ActFromHere() {
   };
 
   // ---------- subsections ----------
-  const closeNewSub = () => { setAddingSub(null); setNewSubName(""); };
+  const openNewSub = (secKey) => { addingSubRef.current = secKey; setAddingSub(secKey); setNewSubName(""); };
+  const closeNewSub = () => { addingSubRef.current = null; setAddingSub(null); setNewSubName(""); };
 
   const commitNewSub = () => {
-    if (!addingSub) return;
+    const secKey = addingSubRef.current;
+    if (!secKey) return; // closed already (Esc) — a stale blur must not create it
     const name = newSubName.trim().slice(0, 80);
-    const secKey = addingSub;
     closeNewSub();
     if (!name) return;
     const st = cur();
@@ -291,9 +313,12 @@ export default function ActFromHere() {
     persist({ ...st, sections: st.sections.map((s) => (s.key !== secKey ? s : { ...s, subs: [...s.subs, { key: "u" + uid(), name }] })) });
   };
 
+  const startSubRename = (sec, key, value) => { editingSubRef.current = { sec, key }; setEditingSub({ sec, key, value }); };
+  const cancelSubRename = () => { editingSubRef.current = null; setEditingSub(null); };
   const commitSubRename = () => {
-    if (!editingSub) return;
+    if (!editingSubRef.current || !editingSub) return;
     const { sec: secKey, key, value } = editingSub;
+    editingSubRef.current = null;
     setEditingSub(null);
     const name = value.trim().slice(0, 80);
     if (!name) return; // empty reverts
@@ -309,7 +334,7 @@ export default function ActFromHere() {
     const st = cur();
     setPendingDeleteSub(null);
     if (addingItem && addingItem.sec === secKey && addingItem.sub === subKey) closeNewItem();
-    if (editingSub && editingSub.sec === secKey && editingSub.key === subKey) setEditingSub(null);
+    if (editingSubRef.current && editingSubRef.current.sec === secKey && editingSubRef.current.key === subKey) cancelSubRename();
     persist({
       ...st,
       sections: st.sections.map((s) => (s.key !== secKey ? s : { ...s, subs: s.subs.filter((x) => x.key !== subKey) })),
@@ -325,10 +350,12 @@ export default function ActFromHere() {
   };
 
   // ---------- category rename ----------
+  const startCatEdit = (key, value) => { editingCatRef.current = key; setEditingCat({ key, value }); };
+  const cancelCatEdit = () => { editingCatRef.current = null; setEditingCat(null); };
   const commitCatEdit = () => {
-    if (!editingCat) return;
+    if (!editingCatRef.current || !editingCat) return;
     const { key, value } = editingCat;
-    setEditingCat(null);
+    cancelCatEdit();
     const name = value.trim().slice(0, 80);
     if (!name) return; // empty reverts to previous value
     const st = cur();
@@ -342,10 +369,12 @@ export default function ActFromHere() {
     if (clash) flash(`heads up — ${glyph} is already used by ${labelFor(clash.key)}`);
   };
 
+  const startGlyphEdit = (key, value) => { editingGlyphRef.current = key; setEditingGlyph({ key, value }); };
+  const cancelGlyphEdit = () => { editingGlyphRef.current = null; setEditingGlyph(null); };
   const commitGlyphEdit = () => {
-    if (!editingGlyph) return;
+    if (!editingGlyphRef.current || !editingGlyph) return;
     const { key, value } = editingGlyph;
-    setEditingGlyph(null);
+    cancelGlyphEdit();
     const g = firstGrapheme(value.trim());
     if (!g) return; // empty reverts
     const st = cur();
@@ -363,10 +392,10 @@ export default function ActFromHere() {
     const { [key]: _c, ...collapsed } = st.collapsed;
     setPendingDelete(null);
     setOpenItem(null);
-    if (editing && editing.sec === key) setEditing(null);
-    if (editingCat && editingCat.key === key) setEditingCat(null);
-    if (addingItem && addingItem.sec === key) closeNewItem();
-    if (addingSub === key) closeNewSub();
+    if (editingRef.current && editingRef.current.sec === key) cancelItemEdit();
+    if (editingCatRef.current === key) cancelCatEdit();
+    if (addingRef.current && addingRef.current.sec === key) closeNewItem();
+    if (addingSubRef.current === key) closeNewSub();
     persist({ ...st, sections: st.sections.filter((s) => s.key !== key), items, labels, collapsed });
   };
 
@@ -404,14 +433,16 @@ export default function ActFromHere() {
   const startEdit = (secKey, it) => {
     if (clickTimer.current) { clearTimeout(clickTimer.current); clickTimer.current = null; }
     setOpenItem((prev) => (prev === it.id ? prev : null)); // don't leave another item's menu hanging open
+    editingRef.current = { sec: secKey, id: it.id };
     setEditing({ sec: secKey, id: it.id, text: it.text, url: it.url || "", next: it.next || "" });
   };
 
   const commitItemEdit = () => {
-    if (!editing) return;
+    if (!editingRef.current || !editing) return; // closed already — a stale blur is a no-op
     const { sec, id } = editing;
     const st = cur();
     const item = st.items[sec] && st.items[sec].find((i) => i.id === id);
+    editingRef.current = null;
     setEditing(null);
     if (!item) return;
     const name = editing.text.trim() || item.text; // empty name reverts
@@ -424,7 +455,7 @@ export default function ActFromHere() {
     persist({ ...st, items: { ...st.items, [sec]: st.items[sec].map((i) => (i.id === id ? updated : i)) } });
   };
 
-  const cancelItemEdit = () => setEditing(null);
+  const cancelItemEdit = () => { editingRef.current = null; setEditing(null); };
 
   // ---------- click vs double-click on item text ----------
   const handleItemClick = (id) => {
@@ -446,25 +477,32 @@ export default function ActFromHere() {
   // Commit open forms, cancel the debounce, and write if anything differs.
   // localStorage.setItem inside storage.set runs before its first await, so
   // by the time the dispatch returns the write has landed.
+  onFlushRef.current = () => {
+    if (editingRef.current) commitItemEdit();
+    if (editingCatRef.current) commitCatEdit();
+    if (editingGlyphRef.current) commitGlyphEdit();
+    if (editingSubRef.current) commitSubRename();
+    if (addingRef.current) commitNewItem(false);
+    if (addingSubRef.current) commitNewSub();
+    if (saveTimer.current) { clearTimeout(saveTimer.current); saveTimer.current = null; }
+    const st = latest.current;
+    if (!st) return;
+    const out = serialize(st);
+    let stored = null;
+    try { stored = localStorage.getItem(STORE_KEY); } catch (e) { /* fall through to write */ }
+    if (stored !== null && out === stored) { setSaveState((s) => (s === "saving" ? "" : s)); return; }
+    // Write directly (the adapter's setItem is synchronous before its first await)
+    // instead of going through flush()'s busy gate, which could defer the write.
+    window.storage.set(STORE_KEY, out).then(() => {
+      setSaveState("saved");
+      setTimeout(() => setSaveState((s) => (s === "saved" ? "" : s)), 1200);
+    }).catch((e) => { console.error("flush write failed", e); setSaveState("error"); });
+  };
   useEffect(() => {
-    const onFlush = () => {
-      if (editing) commitItemEdit();
-      if (editingCat) commitCatEdit();
-      if (editingGlyph) commitGlyphEdit();
-      if (editingSub) commitSubRename();
-      if (addingItem) commitNewItem(false);
-      if (addingSub) commitNewSub();
-      if (saveTimer.current) { clearTimeout(saveTimer.current); saveTimer.current = null; }
-      const st = latest.current;
-      if (!st) return;
-      let stored = null;
-      try { stored = localStorage.getItem(STORE_KEY); } catch (e) { /* fall through to write */ }
-      if (stored !== null && serialize(st) === stored) { setSaveState((s) => (s === "saving" ? "" : s)); return; }
-      flush();
-    };
+    const onFlush = () => onFlushRef.current && onFlushRef.current();
     window.addEventListener("afh:flush", onFlush);
     return () => window.removeEventListener("afh:flush", onFlush);
-  });
+  }, []);
 
   // ---------- AI dump sorter — consumes the LIVE section set ----------
   const sortDump = async () => {
@@ -600,7 +638,7 @@ export default function ActFromHere() {
       </div>
     ) : (
       <button
-        onClick={() => { setAddingItem({ sec: secKey, sub: subKey || null }); setNewItem({ text: "", url: "" }); }}
+        onClick={() => openNewItem(secKey, subKey || null)}
         aria-label={`add item to ${displayLabel}`}
         className="w-full text-center font-mono text-xs py-2 focus:outline-none focus-visible:ring-2 [touch-action:manipulation]"
         style={{ color: C.blue, background: "transparent", borderTop: `1px solid ${C.cardEdge}` }}
@@ -845,19 +883,19 @@ export default function ActFromHere() {
                       onChange={(e) => setEditingCat({ key: sec.key, value: e.target.value })}
                       onKeyDown={(e) => {
                         if (e.key === "Enter") commitCatEdit();
-                        else if (e.key === "Escape") setEditingCat(null);
+                        else if (e.key === "Escape") cancelCatEdit();
                       }}
                       onBlur={commitCatEdit}
                       className="text-sm font-extrabold tracking-widest outline-none"
                       style={{ background: "transparent", color: C.text, borderBottom: `1px solid ${C.blue}`, width: "14rem" }}
                     />
                   ) : (
-                    <span className="truncate" onDoubleClick={() => setEditingCat({ key: sec.key, value: displayLabel })}>{displayLabel}</span>
+                    <span className="truncate" onDoubleClick={() => startCatEdit(sec.key, displayLabel)}>{displayLabel}</span>
                   )}
                 </h2>
                 <span className="flex items-baseline gap-2 flex-shrink-0">
                   <button
-                    onClick={() => { if (addingSub === sec.key) closeNewSub(); else { setAddingSub(sec.key); setNewSubName(""); if (isCollapsed) toggleCollapse(sec.key); } }}
+                    onClick={() => { if (addingSub === sec.key) closeNewSub(); else { openNewSub(sec.key); if (isCollapsed) toggleCollapse(sec.key); } }}
                     aria-label={`add subsection to ${displayLabel}`}
                     className={`font-mono text-xs px-2 py-1 rounded-md focus:outline-none focus-visible:ring-2 [touch-action:manipulation] ${REVEAL_SEC}`}
                     style={{ color: C.blue, border: `1px solid ${C.cardEdge}`, background: "transparent" }}
@@ -897,7 +935,7 @@ export default function ActFromHere() {
                           onClick={(e) => {
                             const el = e.target.closest && e.target.closest("[data-act]");
                             const act = el ? el.getAttribute("data-act") : "";
-                            if (act === "rename") { setEditingSub({ sec: sec.key, key: sub.key, value: sub.name }); return; }
+                            if (act === "rename") { startSubRename(sec.key, sub.key, sub.name); return; }
                             if (act === "delete") { requestDeleteSub(sec.key, sub.key); return; }
                             if (act === "noop") return;
                             toggleSub(sec.key, sub.key);
@@ -913,7 +951,7 @@ export default function ActFromHere() {
                               onChange={(e) => setEditingSub({ ...editingSub, value: e.target.value })}
                               onKeyDown={(e) => {
                                 if (e.key === "Enter") commitSubRename();
-                                else if (e.key === "Escape") setEditingSub(null);
+                                else if (e.key === "Escape") cancelSubRename();
                               }}
                               onBlur={commitSubRename}
                               aria-label={`rename ${sub.name}`}
@@ -1020,7 +1058,7 @@ export default function ActFromHere() {
                           onChange={(e) => setEditingGlyph({ key: s.key, value: firstGrapheme(e.target.value) })}
                           onKeyDown={(e) => {
                             if (e.key === "Enter") commitGlyphEdit();
-                            else if (e.key === "Escape") setEditingGlyph(null);
+                            else if (e.key === "Escape") cancelGlyphEdit();
                           }}
                           onBlur={commitGlyphEdit}
                           aria-label={`glyph for ${name}`}
@@ -1029,7 +1067,7 @@ export default function ActFromHere() {
                         />
                       ) : (
                         <button
-                          onClick={() => setEditingGlyph({ key: s.key, value: s.glyph })}
+                          onClick={() => startGlyphEdit(s.key, s.glyph)}
                           aria-label={`edit glyph for ${name}`}
                           className="w-9 flex-shrink-0 py-1 rounded-md text-sm focus:outline-none focus-visible:ring-2"
                           style={{ color: C.blue, border: `1px solid ${C.cardEdge}`, background: "transparent" }}

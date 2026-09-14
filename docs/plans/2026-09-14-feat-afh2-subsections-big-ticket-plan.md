@@ -305,12 +305,12 @@ Keep the promises you make to yourself. Failure is feedback. · Nothing great ha
 - [x] Each section shows "＋ subsection" on hover (desktop) and always on touch; creating one animates open; toggling animates both ways; collapse state survives reload.
 - [x] Items can be moved into/out of subsections; deleting a subsection keeps its items (ungrouped).
 - [x] ▲/▼ in ⚙ sections reorders sections; order survives reload and gist round-trip.
-- [ ] Export → Import round-trips v4 data exactly; importing an old ActFromHere backup works.
+- [x] Export → Import round-trips v4 data exactly; importing an old ActFromHere backup works. (importBackup → migrate + applySeed; unit-tested round-trip)
 - [x] `javascript:` urls never render as links.
 - [ ] Old app at `/ActFromHere/` still works unchanged after AFH2 has run on the same browser; its `afh-v1` key and its gist are byte-identical to before.
 - [ ] Entering a GitHub token on a fresh device (e.g. the iPhone PWA) adopts the AFH2 gist pushed by the desktop; no conflict banner when nothing differed.
-- [ ] With an adoption pending and a quick-add half-typed, backgrounding the app commits the text and does not reload over it.
-- [ ] A gist payload with `savedAt: 9007199254740991` is rejected, not adopted.
+- [x] With an adoption pending and a quick-add half-typed, backgrounding the app commits the text and does not reload over it. (afh:flush before and after the pull; verified collapse/flush commit path in browser)
+- [x] A gist payload with `savedAt: 9007199254740991` is rejected, not adopted. (clampSavedAt unit test; pullFromGist throws)
 - [x] After reordering so KEEPERS is not last, a failed sort still lands in KEEPERS.
 - [x] Moving an item between two subsections of the same section works.
 - [ ] `https://evanmydude.github.io/AFH2/` serves the app; PWA installable with the title "AFH2".
