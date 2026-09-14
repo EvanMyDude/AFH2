@@ -297,22 +297,22 @@ Keep the promises you make to yourself. Failure is feedback. · Nothing great ha
 
 ## Acceptance criteria
 
-- [ ] `npm test` passes; migration fixtures v1/v2/v3 → v4 lose zero items, labels, urls, next steps, glyphs, collapse states — including a fixture with an orphan item bucket and one with a blank glyph.
-- [ ] A corrupt `afh2-v1` blob renders an error state, is stashed, and is never overwritten or pushed.
+- [x] `npm test` passes; migration fixtures v1/v2/v3 → v4 lose zero items, labels, urls, next steps, glyphs, collapse states — including a fixture with an orphan item bucket and one with a blank glyph.
+- [x] A corrupt `afh2-v1` blob renders an error state, is stashed, and is never overwritten or pushed.
 - [ ] A second device whose AFH2 gist already holds real data adopts it on first boot and stashes (never pushes) its local old-app copy.
-- [ ] AFH2 first boot on a device with `afh-v1` shows every pre-existing item in its section, plus the seeded subsections; `afh-v1` untouched.
-- [ ] Reloading AFH2 does not re-seed; deleting a seeded item and reloading does not resurrect it.
-- [ ] Each section shows "＋ subsection" on hover (desktop) and always on touch; creating one animates open; toggling animates both ways; collapse state survives reload.
-- [ ] Items can be moved into/out of subsections; deleting a subsection keeps its items (ungrouped).
-- [ ] ▲/▼ in ⚙ sections reorders sections; order survives reload and gist round-trip.
+- [x] AFH2 first boot on a device with `afh-v1` shows every pre-existing item in its section, plus the seeded subsections; `afh-v1` untouched.
+- [x] Reloading AFH2 does not re-seed; deleting a seeded item and reloading does not resurrect it.
+- [x] Each section shows "＋ subsection" on hover (desktop) and always on touch; creating one animates open; toggling animates both ways; collapse state survives reload.
+- [x] Items can be moved into/out of subsections; deleting a subsection keeps its items (ungrouped).
+- [x] ▲/▼ in ⚙ sections reorders sections; order survives reload and gist round-trip.
 - [ ] Export → Import round-trips v4 data exactly; importing an old ActFromHere backup works.
-- [ ] `javascript:` urls never render as links.
+- [x] `javascript:` urls never render as links.
 - [ ] Old app at `/ActFromHere/` still works unchanged after AFH2 has run on the same browser; its `afh-v1` key and its gist are byte-identical to before.
 - [ ] Entering a GitHub token on a fresh device (e.g. the iPhone PWA) adopts the AFH2 gist pushed by the desktop; no conflict banner when nothing differed.
 - [ ] With an adoption pending and a quick-add half-typed, backgrounding the app commits the text and does not reload over it.
 - [ ] A gist payload with `savedAt: 9007199254740991` is rejected, not adopted.
-- [ ] After reordering so KEEPERS is not last, a failed sort still lands in KEEPERS.
-- [ ] Moving an item between two subsections of the same section works.
+- [x] After reordering so KEEPERS is not last, a failed sort still lands in KEEPERS.
+- [x] Moving an item between two subsections of the same section works.
 - [ ] `https://evanmydude.github.io/AFH2/` serves the app; PWA installable with the title "AFH2".
 
 ## Verification

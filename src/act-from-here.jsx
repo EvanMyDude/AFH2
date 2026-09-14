@@ -1,4 +1,9 @@
 import { useState, useEffect, useRef } from "react";
+import {
+  DEFAULT_SECTIONS, SECTION_META, SORT_HINTS, MAX_SECTIONS, STORE_KEY, CORRUPT_KEY,
+  uid, firstGrapheme, migrate, serialize, seed, catchAllKey, safeHref,
+} from "./model.js";
+import { applySeed } from "./seed-big-ticket.js";
 
 // ---------- palette (Apple Notes dark, his native habitat) ----------
 const C = {
@@ -14,147 +19,52 @@ const C = {
   green: "#30D158",
 };
 
-// Category IDENTITY is the key — name, glyph, and existence are all data.
-// DEFAULT_SECTIONS seeds first load + provides labels/hints for the built-ins.
-const DEFAULT_SECTIONS = [
-  { key: "week", label: "THIS WEEK", glyph: "‣", hint: "check it off, clear it out" },
-  { key: "decision", label: "DECISIONS TO CLOSE", glyph: "»", hint: "open loops cost more than wrong answers" },
-  { key: "buy", label: "BUY LIST", glyph: "🛒", hint: "one cart, one checkout" },
-  { key: "circleback", label: "CIRCLE BACK", glyph: "∞", hint: "infinity and beyond" },
-  { key: "note", label: "KEEPERS", glyph: "🔦", hint: "no checkbox — just don't lose it" },
-];
-const DEFAULTS_BY_KEY = Object.fromEntries(DEFAULT_SECTIONS.map((s) => [s.key, s]));
-
-// Semantic routing hints for the sorter — keyed by stable id, name-independent.
-const SORT_HINTS = {
-  week: "concrete task doable soon (do/call/finish/schedule/email/clean)",
-  decision: "an open question needing a choice (should I / or no / when do I / keep or sell)",
-  buy: "anything to purchase or order",
-  circleback: 'someday, blocked, later, "once X happens"',
-  note: "mantra, insight, protocol cue, reference — not a task",
-};
-
-const MAX_SECTIONS = 10;
-const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 const CLICK_DELAY = 220; // ms window separating single click (expand) from double click (edit)
+const has = (o, k) => o != null && typeof o === "object" && Object.prototype.hasOwnProperty.call(o, k);
+const metaLabel = (key) => (has(SECTION_META, key) ? SECTION_META[key].label : "UNTITLED");
+const metaHint = (key) => (has(SECTION_META, key) ? SECTION_META[key].hint : "nothing here yet");
+export { migrate, firstGrapheme };
 
-// First grapheme cluster — NOT first JS char. "❤️‍🔥" is 1 cluster / 4 code units;
-// maxLength=1 would shred it. Intl.Segmenter with a code-point fallback.
-export const firstGrapheme = (str) => {
-  const s = String(str || "");
-  if (!s) return "";
-  try {
-    const seg = new Intl.Segmenter(undefined, { granularity: "grapheme" });
-    const it = seg.segment(s)[Symbol.iterator]().next();
-    return it.done ? "" : it.value.segment;
-  } catch (e) {
-    return Array.from(s)[0] || "";
-  }
-};
+// Hover-reveal on pointer devices, always visible (dimmed) on touch. Tailwind's
+// hoverOnlyWhenSupported wraps group-hover in (hover:hover) and (pointer:fine),
+// so the "hidden until hover" rule uses the exact same condition.
+const REVEAL = "opacity-70 [@media(hover:hover)_and_(pointer:fine)]:opacity-0 transition-opacity";
+const REVEAL_SEC = REVEAL + " group-hover:opacity-100 group-focus-within:opacity-100";
+const REVEAL_SUB = REVEAL + " group-hover/sub:opacity-100 group-focus-within/sub:opacity-100";
 
-// v1: { week:[], decision:[], ... }
-// v2: { items, labels, collapsed }
-// v3: v2 + sections:[{key,glyph}]  (order + glyph + existence)
-// Migrations pass item arrays through UNTOUCHED; v2→v3 seeds sections from
-// DEFAULT_SECTIONS so first load looks identical.
-export const migrate = (raw) => {
-  // v3
-  if (raw && typeof raw === "object" && raw.items && Array.isArray(raw.sections)) {
-    const sections = raw.sections
-      .filter((s) => s && typeof s.key === "string" && s.key && typeof s.glyph === "string" && s.glyph)
-      .map((s) => ({ key: s.key, glyph: s.glyph }));
-    return {
-      sections,
-      items: Object.fromEntries(sections.map((s) => [s.key, Array.isArray(raw.items[s.key]) ? raw.items[s.key].map(({ fresh, ...rest }) => rest) : []])),
-      labels: raw.labels && typeof raw.labels === "object" ? raw.labels : {},
-      collapsed: raw.collapsed && typeof raw.collapsed === "object" ? raw.collapsed : {},
-    };
-  }
-  // v2
-  if (raw && typeof raw === "object" && raw.items && typeof raw.items === "object") {
-    return {
-      sections: DEFAULT_SECTIONS.map((s) => ({ key: s.key, glyph: s.glyph })),
-      items: Object.fromEntries(DEFAULT_SECTIONS.map((s) => [s.key, Array.isArray(raw.items[s.key]) ? raw.items[s.key].map(({ fresh, ...rest }) => rest) : []])),
-      labels: raw.labels && typeof raw.labels === "object" ? raw.labels : {},
-      collapsed: raw.collapsed && typeof raw.collapsed === "object" ? raw.collapsed : {},
-    };
-  }
-  // v1 (or unknown)
-  return {
-    sections: DEFAULT_SECTIONS.map((s) => ({ key: s.key, glyph: s.glyph })),
-    items: Object.fromEntries(DEFAULT_SECTIONS.map((s) => [s.key, Array.isArray(raw?.[s.key]) ? raw[s.key].map(({ fresh, ...rest }) => rest) : []])),
-    labels: {},
-    collapsed: {},
-  };
-};
-
-// ---------- seed from ACT-FROM-HERE.md ----------
-const seed = () => ({
-  sections: DEFAULT_SECTIONS.map((s) => ({ key: s.key, glyph: s.glyph })),
-  items: {
-    week: [
-      { id: uid(), text: "Solarium sorting solidification (plan in §5A of the doc)", done: false },
-      { id: uid(), text: "Dr. K", done: false },
-      { id: uid(), text: "Finish Dan's Noodling + everything down to 🛑", done: false },
-      { id: uid(), text: "Weighted vest → into the solarium cart session (one checkout)", done: false },
-      { id: uid(), text: "Meal prep: judge Icon vs. Snap → cb Creative Prep next wk · fitfoodie reply pending 👀", done: false },
-      { id: uid(), text: "Say hbd / check in on people", done: false },
-      { id: uid(), text: "Verify Apple Music car shortcut actually fires the ET mixer", done: false },
-      { id: uid(), text: "Cold plunge: call re: expiry → then buy the 8-pack ($20/sesh)", done: false },
-    ],
-    decision: [
-      { id: uid(), text: "Treadmill — not in the weekly routine + solarium needs floor = sell", done: false },
-      { id: uid(), text: "Desk posture program $30 — calendar slot FIRST, then buy", url: "https://www.gotrom.com/desk-posture-therapy-program-29-99?ac=3&utm_source=e1&utm_medium=email&s=e1&m=email", done: false },
-      { id: uid(), text: "Cable tray for living room — only after cables annoy you twice", done: false },
-      { id: uid(), text: "Skim WF debit around the 6th once — confirm no phantom Gamepass charge", done: false },
-    ],
-    buy: [
-      { id: uid(), text: "3-drawer file cabinet (also covers basket replacement)", url: "https://a.co/d/050FGQTZ", done: false },
-      { id: uid(), text: "Book ends for shelves", done: false },
-      { id: uid(), text: "Storage ottoman 🔥", done: false },
-      { id: uid(), text: "Balance board foot rocker (cheaper than the wishlist one)", done: false },
-      { id: uid(), text: "Body-stuff container — AFTER electronics bin arrives (size check)", done: false },
-      { id: uid(), text: "Slant board — trigger: once in FW", url: "https://frylr.com/products/frylr-wooden-slant-board-calf-stretcher-pain-relief?variant=43257915637838", done: false },
-      { id: uid(), text: "Maybe: small string lights for room", done: false },
-      { id: uid(), text: "L888r: new monitor setup → wide boiiii", done: false },
-    ],
-    circleback: [
-      { id: uid(), text: "Fitness re-entry — pick ONE to trial: Orange Theory · Indigo yoga · climbing", done: false },
-      { id: uid(), text: "Laser foot: 3× more sessions this year + 6× more hydro!!!", done: false },
-      { id: uid(), text: "Micro-needle right arm — next step?", done: false },
-      { id: uid(), text: "Forehead mole removal — when?", done: false },
-      { id: uid(), text: "Finish 🎧 NOTES ON MY BODY JOURNEY pdf (iCloud)", done: false },
-      { id: uid(), text: "Peep 2013 oldest workout logs", done: false },
-      { id: uid(), text: "Shiverrr stimulation — develop or delete on next pass", done: false },
-    ],
-    note: [
-      { id: uid(), text: "No recallin means u ain't ballin", done: false },
-      { id: uid(), text: "Notes don't matter. Fruits do 🍓", done: false },
-      { id: uid(), text: "There's no expectation: I HAVE EVERY RIGHT TO BE HERE.", done: false },
-    ],
-  },
-  labels: {},
-  collapsed: {},
-});
-
-const STORE_KEY = "afh-v1";
+// Smooth open/close with unknown content height and no unmount: grid rows 0fr↔1fr.
+// overflow-clip (not hidden) so a focused child can't scroll the box on iOS;
+// contain:layout avoids a Safari end-of-transition flicker; inert removes the
+// collapsed content from tab order and taps.
+function Collapsible({ open, children }) {
+  return (
+    <div className="grid transition-[grid-template-rows] duration-200 ease-out motion-reduce:transition-none" style={{ gridTemplateRows: open ? "1fr" : "0fr" }}>
+      <div className="min-h-0 overflow-clip [contain:layout]" inert={!open}>{children}</div>
+    </div>
+  );
+}
 
 export default function ActFromHere() {
-  const [data, setData] = useState(null); // { sections, items, labels, collapsed }
+  const [data, setData] = useState(null); // v4 state — see model.js
+  const [loadError, setLoadError] = useState("");
   const [dump, setDump] = useState("");
   const [sorting, setSorting] = useState(false);
   const [toast, setToast] = useState("");
   const [saveState, setSaveState] = useState("");
   const [openItem, setOpenItem] = useState(null);
-  const [editing, setEditing] = useState(null);         // { sec, id, text, url }
+  const [editing, setEditing] = useState(null);         // { sec, id, text, url, next }
   const [editingCat, setEditingCat] = useState(null);   // { key, value }
   const [managerOpen, setManagerOpen] = useState(false);
   const [editingGlyph, setEditingGlyph] = useState(null); // { key, value }
-  const [pendingDelete, setPendingDelete] = useState(null); // key
+  const [pendingDelete, setPendingDelete] = useState(null); // section key
   const [adding, setAdding] = useState(false);
   const [newSec, setNewSec] = useState({ glyph: "", name: "" });
-  const [addingItem, setAddingItem] = useState(null); // section key with an open quick-add form
+  const [addingItem, setAddingItem] = useState(null); // { sec, sub } with an open quick-add form
   const [newItem, setNewItem] = useState({ text: "", url: "" });
+  const [addingSub, setAddingSub] = useState(null);   // section key with an open new-subsection form
+  const [newSubName, setNewSubName] = useState("");
+  const [editingSub, setEditingSub] = useState(null); // { sec, key, value }
+  const [pendingDeleteSub, setPendingDeleteSub] = useState(null); // { sec, key }
   const addItemInputRef = useRef(null);
   const toastTimer = useRef(null);
   const latest = useRef(null);     // newest state, source of truth for writes AND mutations
@@ -166,32 +76,42 @@ export default function ActFromHere() {
   const cur = () => latest.current;
   const labelFor = (key) => {
     const st = latest.current || data;
-    return (st && st.labels && st.labels[key]) || (DEFAULTS_BY_KEY[key] && DEFAULTS_BY_KEY[key].label) || "UNTITLED";
+    return (st && has(st.labels, key) && st.labels[key]) || metaLabel(key);
   };
 
   // ---------- load ----------
+  // Only the adapter's explicit "key not found" seeds. A parse failure stashes
+  // the raw string and renders an error — it never overwrites (and so never
+  // pushes a fresh seed over the gist).
   useEffect(() => {
     (async () => {
+      let res;
       try {
-        const res = await window.storage.get(STORE_KEY);
-        const parsed = JSON.parse(res.value);
-        const migrated = migrate(parsed);
-        latest.current = migrated;
-        setData(migrated);
-        if (!parsed.items || !Array.isArray(parsed.sections)) scheduleSave(); // persist migrated shape via the writer
+        res = await window.storage.get(STORE_KEY);
       } catch (e) {
-        const s = seed();
+        const s = applySeed(seed());
         latest.current = s;
         setData(s);
         scheduleSave();
+        return;
+      }
+      try {
+        const migrated = migrate(JSON.parse(res.value));
+        latest.current = migrated;
+        setData(migrated);
+        if (serialize(migrated) !== res.value) scheduleSave(); // persist the canonical shape via the writer
+      } catch (e) {
+        console.error("load failed", e);
+        try { localStorage.setItem(CORRUPT_KEY, String(res.value)); } catch (e2) { /* quota — nothing else to do */ }
+        setLoadError(String((e && e.message) || e));
       }
     })();
   }, []);
 
   // ---------- save ----------
-  // Writes are debounced + serialized: rapid taps (check, check, clear, rename,
-  // glyph edit, add, delete) coalesce into ONE storage.set instead of a burst
-  // that trips the rate limit. Failed writes retry with backoff; nothing is dropped.
+  // Writes are debounced + serialized: rapid taps coalesce into ONE storage.set.
+  // Failed writes retry with backoff; nothing is dropped. serialize() is the
+  // only producer of the persisted string.
   const flush = async () => {
     if (busy.current) { dirty.current = true; return; }
     busy.current = true;
@@ -199,18 +119,11 @@ export default function ActFromHere() {
     let ok = false;
     for (let attempt = 0; attempt < 3 && !ok; attempt++) {
       try {
-        // strip cosmetic `fresh` flags so highlights don't survive reload
-        const src = latest.current;
-        const clean = {
-          sections: src.sections,
-          items: Object.fromEntries(Object.entries(src.items).map(([k, arr]) => [k, arr.map(({ fresh, ...rest }) => rest)])),
-          labels: src.labels,
-          collapsed: src.collapsed,
-        };
-        await window.storage.set(STORE_KEY, JSON.stringify(clean));
+        await window.storage.set(STORE_KEY, serialize(latest.current));
         ok = true;
       } catch (e) {
         console.error("save attempt", attempt + 1, "failed", e);
+        setSaveState("error"); // surface immediately; retries continue
         await new Promise((r) => setTimeout(r, 500 * (attempt + 1)));
       }
     }
@@ -237,8 +150,7 @@ export default function ActFromHere() {
   };
 
   // Cosmetic state updates (e.g. clearing flash highlights) — keeps latest.current
-  // and rendered data in LOCKSTEP without scheduling a write. If these diverge,
-  // later persists rebuild from latest and resurrect stale flags (the stuck-blue bug).
+  // and rendered data in LOCKSTEP without scheduling a write.
   const setLocal = (updater) => {
     const st = latest.current;
     if (!st) return;
@@ -266,47 +178,54 @@ export default function ActFromHere() {
     persist({ ...st, items: { ...st.items, [secKey]: st.items[secKey].filter((it) => it.id !== id) } });
   };
 
-  const move = (fromSec, id, toSec) => {
-    if (fromSec === toSec) return;
-    const st = cur();
-    const item = st.items[fromSec].find((it) => it.id === id);
-    if (!item) return;
-    setOpenItem(null);
-    persist({
-      ...st,
-      items: {
-        ...st.items,
-        [fromSec]: st.items[fromSec].filter((it) => it.id !== id),
-        [toSec]: [{ ...item, fresh: true }, ...st.items[toSec]],
-      },
-    });
+  const unflash = (secKey, delay) => {
     setTimeout(() => {
-      setLocal((st) => (st.items[toSec] ? { ...st, items: { ...st.items, [toSec]: st.items[toSec].map((it) => (it.fresh ? { ...it, fresh: false } : it)) } } : null));
-    }, 1500);
+      setLocal((st) => (st.items[secKey] ? { ...st, items: { ...st.items, [secKey]: st.items[secKey].map((it) => (it.fresh ? { ...it, fresh: false } : it)) } } : null));
+    }, delay);
   };
 
-  // ---------- quick add (per-section) ----------
+  // target = "secKey/subKey" ("secKey/" = ungrouped). Same section + same sub → no-op.
+  const move = (fromSec, id, target) => {
+    const slash = target.indexOf("/");
+    const toSec = slash < 0 ? target : target.slice(0, slash);
+    const toSub = slash < 0 ? "" : target.slice(slash + 1);
+    const st = cur();
+    const item = (st.items[fromSec] || []).find((it) => it.id === id);
+    if (!item || !st.items[toSec]) return;
+    if (fromSec === toSec && (item.sub || "") === toSub) return;
+    setOpenItem(null);
+    const { sub: _s, ...rest } = item;
+    const moved = { ...rest, fresh: true };
+    if (toSub) moved.sub = toSub;
+    const without = st.items[fromSec].filter((it) => it.id !== id);
+    const items = { ...st.items, [fromSec]: without };
+    items[toSec] = [moved, ...(fromSec === toSec ? without : st.items[toSec])];
+    persist({ ...st, items });
+    unflash(toSec, 1500);
+  };
+
+  // ---------- quick add (per section or subsection) ----------
   // Enter commits and keeps the form open for rapid consecutive entry;
   // tapping away commits and closes; Esc discards; empty text creates nothing.
   const closeNewItem = () => { setAddingItem(null); setNewItem({ text: "", url: "" }); };
 
   const commitNewItem = (keepOpen) => {
     if (!addingItem) return;
-    const secKey = addingItem;
+    const { sec: secKey, sub } = addingItem;
     const text = newItem.text.trim();
     const url = newItem.url.trim();
     if (!text) { if (!keepOpen) closeNewItem(); return; }
     const st = cur();
     if (!st.items[secKey]) { closeNewItem(); return; } // section deleted mid-entry
+    const secEntry = st.sections.find((s) => s.key === secKey);
     const item = { id: uid(), text, done: false, fresh: true };
     if (url) item.url = url;
+    if (sub && secEntry && secEntry.subs.some((x) => x.key === sub)) item.sub = sub;
     persist({ ...st, items: { ...st.items, [secKey]: [item, ...st.items[secKey]] } });
     setNewItem({ text: "", url: "" });
     if (!keepOpen) closeNewItem();
     else setTimeout(() => { if (addItemInputRef.current) addItemInputRef.current.focus(); }, 0);
-    setTimeout(() => {
-      setLocal((st) => (st.items[secKey] ? { ...st, items: { ...st.items, [secKey]: st.items[secKey].map((x) => (x.fresh ? { ...x, fresh: false } : x)) } } : null));
-    }, 1800);
+    unflash(secKey, 1800);
   };
 
   const doneCount = data ? Object.values(data.items).flat().filter((it) => it.done).length : 0;
@@ -320,9 +239,89 @@ export default function ActFromHere() {
   };
 
   // ---------- collapse ----------
+  // Bodies never unmount (smooth animation), so transient state inside a
+  // collapsing section must be cleared by hand.
+  const clearTransient = (secKey, subKey) => {
+    const inScope = (s) => s === secKey && (subKey == null || true);
+    if (editing && inScope(editing.sec)) setEditing(null);
+    if (addingItem && addingItem.sec === secKey && (subKey == null || addingItem.sub === subKey)) closeNewItem();
+    if (openItem) {
+      const st = cur();
+      const it = (st.items[secKey] || []).find((i) => i.id === openItem);
+      if (it && (subKey == null || it.sub === subKey)) setOpenItem(null);
+    }
+    if (clickTimer.current) { clearTimeout(clickTimer.current); clickTimer.current = null; }
+  };
+
   const toggleCollapse = (key) => {
     const st = cur();
-    persist({ ...st, collapsed: { ...st.collapsed, [key]: !st.collapsed[key] } });
+    const collapsing = !st.collapsed[key];
+    if (collapsing) clearTransient(key, null);
+    const collapsed = { ...st.collapsed };
+    if (collapsing) collapsed[key] = true; else delete collapsed[key];
+    persist({ ...st, collapsed });
+  };
+
+  const toggleSub = (secKey, subKey) => {
+    const st = cur();
+    const sec = st.sections.find((s) => s.key === secKey);
+    const sub = sec && sec.subs.find((x) => x.key === subKey);
+    if (!sub) return;
+    if (!sub.collapsed) clearTransient(secKey, subKey);
+    persist({
+      ...st,
+      sections: st.sections.map((s) => (s.key !== secKey ? s : {
+        ...s,
+        subs: s.subs.map((x) => (x.key !== subKey ? x : (x.collapsed ? { key: x.key, name: x.name } : { ...x, collapsed: true }))),
+      })),
+    });
+  };
+
+  // ---------- subsections ----------
+  const closeNewSub = () => { setAddingSub(null); setNewSubName(""); };
+
+  const commitNewSub = () => {
+    if (!addingSub) return;
+    const name = newSubName.trim().slice(0, 80);
+    const secKey = addingSub;
+    closeNewSub();
+    if (!name) return;
+    const st = cur();
+    if (!st.sections.some((s) => s.key === secKey)) return;
+    persist({ ...st, sections: st.sections.map((s) => (s.key !== secKey ? s : { ...s, subs: [...s.subs, { key: "u" + uid(), name }] })) });
+  };
+
+  const commitSubRename = () => {
+    if (!editingSub) return;
+    const { sec: secKey, key, value } = editingSub;
+    setEditingSub(null);
+    const name = value.trim().slice(0, 80);
+    if (!name) return; // empty reverts
+    const st = cur();
+    const sec = st.sections.find((s) => s.key === secKey);
+    const sub = sec && sec.subs.find((x) => x.key === key);
+    if (!sub || sub.name === name) return;
+    persist({ ...st, sections: st.sections.map((s) => (s.key !== secKey ? s : { ...s, subs: s.subs.map((x) => (x.key === key ? { ...x, name } : x)) })) });
+  };
+
+  // Items fall back to ungrouped — nothing is lost.
+  const deleteSub = (secKey, subKey) => {
+    const st = cur();
+    setPendingDeleteSub(null);
+    if (addingItem && addingItem.sec === secKey && addingItem.sub === subKey) closeNewItem();
+    if (editingSub && editingSub.sec === secKey && editingSub.key === subKey) setEditingSub(null);
+    persist({
+      ...st,
+      sections: st.sections.map((s) => (s.key !== secKey ? s : { ...s, subs: s.subs.filter((x) => x.key !== subKey) })),
+      items: { ...st.items, [secKey]: (st.items[secKey] || []).map((it) => (it.sub === subKey ? (({ sub, ...rest }) => rest)(it) : it)) },
+    });
+  };
+
+  const requestDeleteSub = (secKey, subKey) => {
+    const st = cur();
+    const n = (st.items[secKey] || []).filter((it) => it.sub === subKey).length;
+    if (n === 0) deleteSub(secKey, subKey);
+    else setPendingDeleteSub({ sec: secKey, key: subKey });
   };
 
   // ---------- category rename ----------
@@ -330,11 +329,10 @@ export default function ActFromHere() {
     if (!editingCat) return;
     const { key, value } = editingCat;
     setEditingCat(null);
-    const name = value.trim();
+    const name = value.trim().slice(0, 80);
     if (!name) return; // empty reverts to previous value
     const st = cur();
-    const currentName = (st.labels && st.labels[key]) || (DEFAULTS_BY_KEY[key] && DEFAULTS_BY_KEY[key].label) || "UNTITLED";
-    if (name === currentName) return;
+    if (name === labelFor(key)) return;
     persist({ ...st, labels: { ...st.labels, [key]: name } });
   };
 
@@ -367,12 +365,14 @@ export default function ActFromHere() {
     setOpenItem(null);
     if (editing && editing.sec === key) setEditing(null);
     if (editingCat && editingCat.key === key) setEditingCat(null);
-    persist({ sections: st.sections.filter((s) => s.key !== key), items, labels, collapsed });
+    if (addingItem && addingItem.sec === key) closeNewItem();
+    if (addingSub === key) closeNewSub();
+    persist({ ...st, sections: st.sections.filter((s) => s.key !== key), items, labels, collapsed });
   };
 
   const addSection = () => {
     const g = firstGrapheme(newSec.glyph.trim());
-    const n = newSec.name.trim();
+    const n = newSec.name.trim().slice(0, 80);
     if (!g || !n) return;
     const st = cur();
     if (st.sections.length >= MAX_SECTIONS) return;
@@ -380,13 +380,24 @@ export default function ActFromHere() {
     const key = "s" + uid();
     persist({
       ...st,
-      sections: [...st.sections, { key, glyph: g }],
+      sections: [...st.sections, { key, glyph: g, subs: [] }],
       items: { ...st.items, [key]: [] },
       labels: { ...st.labels, [key]: n },
       // collapsed left unset → defaults open
     });
     setNewSec({ glyph: "", name: "" });
     setAdding(false);
+  };
+
+  // Reorder = permute the sections array. Everything else is keyed by key.
+  const moveSection = (key, dir) => {
+    const st = cur();
+    const i = st.sections.findIndex((s) => s.key === key);
+    const j = i + dir;
+    if (i < 0 || j < 0 || j >= st.sections.length) return;
+    const arr = [...st.sections];
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+    persist({ ...st, sections: arr });
   };
 
   // ---------- item edit ----------
@@ -430,6 +441,31 @@ export default function ActFromHere() {
     startEdit(secKey, it);
   };
 
+  // ---------- afh:flush — the sync layer asks us to land everything NOW ----------
+  // Fired synchronously before the page hides and before any gist adoption.
+  // Commit open forms, cancel the debounce, and write if anything differs.
+  // localStorage.setItem inside storage.set runs before its first await, so
+  // by the time the dispatch returns the write has landed.
+  useEffect(() => {
+    const onFlush = () => {
+      if (editing) commitItemEdit();
+      if (editingCat) commitCatEdit();
+      if (editingGlyph) commitGlyphEdit();
+      if (editingSub) commitSubRename();
+      if (addingItem) commitNewItem(false);
+      if (addingSub) commitNewSub();
+      if (saveTimer.current) { clearTimeout(saveTimer.current); saveTimer.current = null; }
+      const st = latest.current;
+      if (!st) return;
+      let stored = null;
+      try { stored = localStorage.getItem(STORE_KEY); } catch (e) { /* fall through to write */ }
+      if (stored !== null && serialize(st) === stored) { setSaveState((s) => (s === "saving" ? "" : s)); return; }
+      flush();
+    };
+    window.addEventListener("afh:flush", onFlush);
+    return () => window.removeEventListener("afh:flush", onFlush);
+  });
+
   // ---------- AI dump sorter — consumes the LIVE section set ----------
   const sortDump = async () => {
     const raw = dump.trim();
@@ -443,14 +479,14 @@ export default function ActFromHere() {
     try {
       const liveSecs = stNow.sections;
       const bucketLines = liveSecs
-        .map((s) => `- "${s.key}": ${labelFor(s.key)} — ${SORT_HINTS[s.key] || "route here anything that fits this section's name"}`)
+        .map((s) => `- "${s.key}": ${JSON.stringify(labelFor(s.key))} — ${has(SORT_HINTS, s.key) ? SORT_HINTS[s.key] : "route here anything that fits this section's name"}`)
         .join("\n");
       const keyEnum = liveSecs.map((s) => s.key).join("|");
       const response = await fetch("https://api.anthropic.com/v1/messages", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          model: "claude-sonnet-4-6",
+          model: "claude-sonnet-5",
           max_tokens: 1000,
           messages: [
             {
@@ -472,13 +508,13 @@ export default function ActFromHere() {
       if (!Array.isArray(arr) || !arr.length) throw new Error("empty");
       const st = cur();
       const valid = new Set(st.sections.map((s) => s.key));
-      const catchAll = st.sections[st.sections.length - 1].key;
+      const catchAll = catchAllKey(st.sections);
       const nextItems = { ...st.items };
       let n = 0;
-      for (const it of arr) {
+      for (const it of arr.slice(0, 500)) {
         if (!it || !it.text) continue;
         const sec = valid.has(it.section) ? it.section : catchAll;
-        nextItems[sec] = [{ id: uid(), text: String(it.text), done: false, fresh: true }, ...nextItems[sec]];
+        nextItems[sec] = [{ id: uid(), text: String(it.text).slice(0, 2000), done: false, fresh: true }, ...nextItems[sec]];
         n++;
       }
       persist({ ...st, items: nextItems });
@@ -490,10 +526,10 @@ export default function ActFromHere() {
     } catch (e) {
       console.error(e);
       const reason = String(e && e.message ? e.message : e).slice(0, 90);
-      // fallback: raw lines land in the last section so nothing is lost
+      // fallback: raw lines land in the catch-all so nothing is lost
       const st = cur();
-      if (!st.sections.length) { setSorting(false); return; }
-      const catchAll = st.sections[st.sections.length - 1].key;
+      const catchAll = catchAllKey(st.sections);
+      if (!catchAll) { setSorting(false); return; }
       const lines = raw.split("\n").map((l) => l.trim()).filter((l) => l && !/^[=^\-\s]+$/.test(l));
       persist({ ...st, items: { ...st.items, [catchAll]: [...lines.map((l) => ({ id: uid(), text: l, done: false, fresh: true })), ...st.items[catchAll]] } });
       setDump("");
@@ -504,9 +540,20 @@ export default function ActFromHere() {
   };
 
   // ---------- render ----------
+  if (loadError) {
+    return (
+      <div className="min-h-screen min-h-[100dvh] flex items-center justify-center px-6" style={{ background: C.bg, color: C.dim }}>
+        <div className="font-mono text-xs leading-relaxed max-w-md">
+          <div style={{ color: C.red }}>couldn't read saved data — nothing was overwritten.</div>
+          <div className="mt-2">the raw copy is stashed as <span style={{ color: C.text }}>{CORRUPT_KEY}</span> in this browser. use the ⇄ panel to import a backup, or pull from the gist.</div>
+          <div className="mt-2" style={{ color: C.faint }}>{loadError}</div>
+        </div>
+      </div>
+    );
+  }
   if (!data) {
     return (
-      <div className="min-h-screen flex items-center justify-center" style={{ background: C.bg, color: C.dim }}>
+      <div className="min-h-screen min-h-[100dvh] flex items-center justify-center" style={{ background: C.bg, color: C.dim }}>
         <div className="font-mono text-sm tracking-widest">loading the surface…</div>
       </div>
     );
@@ -514,9 +561,191 @@ export default function ActFromHere() {
 
   const atCap = data.sections.length >= MAX_SECTIONS;
   const newSecValid = !!firstGrapheme(newSec.glyph.trim()) && !!newSec.name.trim();
+  const inputStyle = { background: C.bg, color: C.text, border: `1px solid ${C.cardEdge}` };
+
+  const renderQuickAdd = (secKey, subKey, displayLabel) => {
+    const isOpen = addingItem && addingItem.sec === secKey && (addingItem.sub || null) === (subKey || null);
+    return isOpen ? (
+      <div
+        className="px-3 py-2.5"
+        style={{ borderTop: `1px solid ${C.cardEdge}` }}
+        onBlur={(e) => { if (!e.currentTarget.contains(e.relatedTarget)) commitNewItem(false); }}
+      >
+        <input
+          ref={addItemInputRef}
+          autoFocus
+          value={newItem.text}
+          onChange={(e) => setNewItem({ ...newItem, text: e.target.value })}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") commitNewItem(true);
+            else if (e.key === "Escape") closeNewItem();
+          }}
+          placeholder="new item — enter to add another"
+          aria-label={`new item in ${displayLabel}`}
+          className="w-full text-sm leading-snug outline-none rounded-md px-2 py-1"
+          style={{ ...inputStyle, border: `1px solid ${C.blue}` }}
+        />
+        <input
+          value={newItem.url}
+          onChange={(e) => setNewItem({ ...newItem, url: e.target.value })}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") commitNewItem(true);
+            else if (e.key === "Escape") closeNewItem();
+          }}
+          placeholder="link — optional"
+          aria-label={`new item link in ${displayLabel}`}
+          className="w-full mt-1.5 text-xs font-mono outline-none rounded-md px-2 py-1"
+          style={{ ...inputStyle, color: C.blue }}
+        />
+      </div>
+    ) : (
+      <button
+        onClick={() => { setAddingItem({ sec: secKey, sub: subKey || null }); setNewItem({ text: "", url: "" }); }}
+        aria-label={`add item to ${displayLabel}`}
+        className="w-full text-center font-mono text-xs py-2 focus:outline-none focus-visible:ring-2 [touch-action:manipulation]"
+        style={{ color: C.blue, background: "transparent", borderTop: `1px solid ${C.cardEdge}` }}
+      >
+        ＋ add item
+      </button>
+    );
+  };
+
+  const renderItem = (sec, it, idx) => {
+    const isEditing = editing && editing.id === it.id && editing.sec === sec.key;
+    const href = safeHref(it.url);
+    const subKeys = new Set(sec.subs.map((x) => x.key));
+    const position = `${sec.key}/${it.sub && subKeys.has(it.sub) ? it.sub : ""}`;
+    return (
+      <div
+        key={it.id}
+        className="transition-colors duration-700"
+        style={{
+          borderTop: idx === 0 ? "none" : `1px solid ${C.cardEdge}`,
+          background: it.fresh ? C.blueSoft : "transparent",
+        }}
+      >
+        <div className="flex items-start gap-3 px-3 py-2.5">
+          {sec.key !== "note" ? (
+            <button
+              onClick={() => toggle(sec.key, it.id)}
+              aria-label={it.done ? "mark not done" : "mark done"}
+              className="mt-0.5 w-5 h-5 rounded-full flex-shrink-0 flex items-center justify-center text-xs focus:outline-none focus-visible:ring-2"
+              style={{
+                border: `1.5px solid ${it.done ? C.blue : C.faint}`,
+                background: it.done ? C.blue : "transparent",
+                color: "#fff",
+              }}
+            >
+              {it.done ? "✓" : ""}
+            </button>
+          ) : (
+            <span className="mt-0.5 w-5 flex-shrink-0 text-center" style={{ color: C.faint }}>·</span>
+          )}
+          <div className="flex-1 min-w-0">
+            {isEditing ? (
+              <div onBlur={(e) => { if (!e.currentTarget.contains(e.relatedTarget)) commitItemEdit(); }}>
+                <input
+                  autoFocus
+                  value={editing.text}
+                  onChange={(e) => setEditing({ ...editing, text: e.target.value })}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") commitItemEdit();
+                    else if (e.key === "Escape") cancelItemEdit();
+                  }}
+                  className="w-full text-sm leading-snug outline-none rounded-md px-2 py-1"
+                  style={{ ...inputStyle, border: `1px solid ${C.blue}` }}
+                />
+                <input
+                  value={editing.next}
+                  onChange={(e) => setEditing({ ...editing, next: e.target.value })}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") commitItemEdit();
+                    else if (e.key === "Escape") cancelItemEdit();
+                  }}
+                  placeholder="→ next step — optional"
+                  aria-label="next step"
+                  className="w-full mt-1.5 text-xs outline-none rounded-md px-2 py-1"
+                  style={inputStyle}
+                />
+                <input
+                  value={editing.url}
+                  onChange={(e) => setEditing({ ...editing, url: e.target.value })}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") commitItemEdit();
+                    else if (e.key === "Escape") cancelItemEdit();
+                  }}
+                  placeholder="link — leave empty for none"
+                  className="w-full mt-1.5 text-xs font-mono outline-none rounded-md px-2 py-1"
+                  style={{ ...inputStyle, color: C.blue }}
+                />
+              </div>
+            ) : (
+              <>
+                <button
+                  onClick={() => handleItemClick(it.id)}
+                  onDoubleClick={() => handleItemDblClick(sec.key, it)}
+                  className="text-left w-full text-sm leading-snug focus:outline-none"
+                  style={{
+                    color: it.done ? C.faint : C.text,
+                    textDecoration: it.done ? "line-through" : "none",
+                  }}
+                >
+                  {it.text}
+                </button>
+                {it.next && (
+                  <div className="text-xs mt-0.5" style={{ color: C.dim }}>→ {it.next}</div>
+                )}
+                {it.url && (href ? (
+                  <a href={href} target="_blank" rel="noreferrer" className="inline-block mt-0.5 text-xs font-mono" style={{ color: C.blue }}>
+                    link ↗
+                  </a>
+                ) : (
+                  <span className="inline-block mt-0.5 text-xs font-mono" style={{ color: C.faint }} title={it.url}>link blocked (unsafe scheme)</span>
+                ))}
+                {openItem === it.id && (
+                  <div className="flex items-center gap-2 mt-2 mb-1 flex-wrap">
+                    <select
+                      value={position}
+                      onChange={(e) => move(sec.key, it.id, e.target.value)}
+                      aria-label="move to"
+                      className="text-xs font-mono rounded-md px-2 py-1 focus:outline-none max-w-full"
+                      style={inputStyle}
+                    >
+                      {data.sections.map((s) => (
+                        <optgroup key={s.key} label={`${s.glyph} ${labelFor(s.key).toLowerCase()}`}>
+                          <option value={`${s.key}/`}>{s.glyph} {labelFor(s.key).toLowerCase()}</option>
+                          {s.subs.map((x) => (
+                            <option key={x.key} value={`${s.key}/${x.key}`}>{"  › "}{x.name.toLowerCase()}</option>
+                          ))}
+                        </optgroup>
+                      ))}
+                    </select>
+                    <button
+                      onClick={() => startEdit(sec.key, it)}
+                      className="text-xs font-mono px-2 py-1 rounded-md focus:outline-none focus-visible:ring-2"
+                      style={{ color: C.blue, border: `1px solid ${C.cardEdge}` }}
+                    >
+                      edit
+                    </button>
+                    <button
+                      onClick={() => remove(sec.key, it.id)}
+                      className="text-xs font-mono px-2 py-1 rounded-md focus:outline-none focus-visible:ring-2"
+                      style={{ color: C.red, border: `1px solid ${C.cardEdge}` }}
+                    >
+                      delete
+                    </button>
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  };
 
   return (
-    <div className="min-h-screen pb-24" style={{ background: C.bg, color: C.text, fontFamily: "-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Roboto, sans-serif" }}>
+    <div className="min-h-screen min-h-[100dvh] pb-24" style={{ background: C.bg, color: C.text, fontFamily: "-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Roboto, sans-serif" }}>
       <div className="max-w-xl mx-auto px-4 pt-6">
 
         {/* header */}
@@ -551,7 +780,7 @@ export default function ActFromHere() {
             placeholder={"‣ call about the thing\n» buy the other thing\nsome mantra that hit 🔦\n…"}
             rows={4}
             className="w-full rounded-lg p-3 text-sm font-mono resize-y outline-none"
-            style={{ background: C.bg, color: C.text, border: `1px solid ${C.cardEdge}`, caretColor: C.blue }}
+            style={{ ...inputStyle, caretColor: C.blue }}
           />
           <div className="flex justify-between items-center mt-2">
             <span className="font-mono text-xs" style={{ color: C.faint }}>
@@ -589,25 +818,22 @@ export default function ActFromHere() {
         </div>
 
         {/* sections */}
-        {data.sections.map((secEntry) => {
-          const sec = {
-            key: secEntry.key,
-            glyph: secEntry.glyph,
-            hint: (DEFAULTS_BY_KEY[secEntry.key] && DEFAULTS_BY_KEY[secEntry.key].hint) || "nothing here yet",
-          };
+        {data.sections.map((sec) => {
           const items = data.items[sec.key] || [];
           const open = items.filter((i) => !i.done).length;
           const isCollapsed = !!data.collapsed[sec.key];
-          const displayLabel = (data.labels && data.labels[sec.key]) || (DEFAULTS_BY_KEY[sec.key] && DEFAULTS_BY_KEY[sec.key].label) || "UNTITLED";
+          const displayLabel = labelFor(sec.key);
+          const subKeys = new Set(sec.subs.map((x) => x.key));
+          const ungrouped = items.filter((i) => !i.sub || !subKeys.has(i.sub));
           return (
-            <div key={sec.key} className="mb-6">
-              <div className="flex items-baseline justify-between mb-2 px-1">
-                <h2 className="text-sm font-extrabold tracking-widest flex items-baseline gap-1.5" style={{ color: C.text }}>
+            <div key={sec.key} className="mb-6 group">
+              <div className="flex items-baseline justify-between mb-2 px-1 gap-2">
+                <h2 className="text-sm font-extrabold tracking-widest flex items-baseline gap-1.5 min-w-0" style={{ color: C.text }}>
                   <button
                     onClick={() => toggleCollapse(sec.key)}
                     aria-expanded={!isCollapsed}
                     aria-label={`${isCollapsed ? "expand" : "collapse"} ${displayLabel}`}
-                    className="focus:outline-none focus-visible:ring-2"
+                    className="focus:outline-none focus-visible:ring-2 [touch-action:manipulation]"
                     style={{ color: C.blue, opacity: isCollapsed ? 0.5 : 1, background: "transparent" }}
                   >
                     {sec.glyph}
@@ -626,196 +852,126 @@ export default function ActFromHere() {
                       style={{ background: "transparent", color: C.text, borderBottom: `1px solid ${C.blue}`, width: "14rem" }}
                     />
                   ) : (
-                    <span onDoubleClick={() => setEditingCat({ key: sec.key, value: displayLabel })}>{displayLabel}</span>
+                    <span className="truncate" onDoubleClick={() => setEditingCat({ key: sec.key, value: displayLabel })}>{displayLabel}</span>
                   )}
                 </h2>
-                <span className="font-mono text-xs" style={{ color: C.faint }}>
-                  {sec.key === "note" ? `${items.length}` : `${open} open`}
+                <span className="flex items-baseline gap-2 flex-shrink-0">
+                  <button
+                    onClick={() => { if (addingSub === sec.key) closeNewSub(); else { setAddingSub(sec.key); setNewSubName(""); if (isCollapsed) toggleCollapse(sec.key); } }}
+                    aria-label={`add subsection to ${displayLabel}`}
+                    className={`font-mono text-xs px-2 py-1 rounded-md focus:outline-none focus-visible:ring-2 [touch-action:manipulation] ${REVEAL_SEC}`}
+                    style={{ color: C.blue, border: `1px solid ${C.cardEdge}`, background: "transparent" }}
+                  >
+                    ＋ subsection
+                  </button>
+                  <span className="font-mono text-xs" style={{ color: C.faint }}>
+                    {sec.key === "note" ? `${items.length}` : `${open} open`}
+                  </span>
                 </span>
               </div>
-              {!isCollapsed && (
+              <Collapsible open={!isCollapsed}>
                 <div className="rounded-2xl overflow-hidden" style={{ background: C.card, border: `1px solid ${C.cardEdge}` }}>
-                  {items.length === 0 && (
+                  {items.length === 0 && sec.subs.length === 0 && (
                     <div className="px-4 py-4 text-sm" style={{ color: C.faint }}>
-                      empty — {sec.hint}
+                      empty — {metaHint(sec.key)}
                     </div>
                   )}
-                  {items.map((it, idx) => {
-                    const isEditing = editing && editing.id === it.id && editing.sec === sec.key;
+                  {ungrouped.map((it, idx) => renderItem(sec, it, idx))}
+                  {renderQuickAdd(sec.key, null, displayLabel)}
+
+                  {/* subsections */}
+                  {sec.subs.map((sub) => {
+                    const subItems = items.filter((i) => i.sub === sub.key);
+                    const subOpen = subItems.filter((i) => !i.done).length;
+                    const isRenaming = editingSub && editingSub.sec === sec.key && editingSub.key === sub.key;
+                    const isPendingDelete = pendingDeleteSub && pendingDeleteSub.sec === sec.key && pendingDeleteSub.key === sub.key;
                     return (
-                      <div
-                        key={it.id}
-                        className="transition-colors duration-700"
-                        style={{
-                          borderTop: idx === 0 ? "none" : `1px solid ${C.cardEdge}`,
-                          background: it.fresh ? C.blueSoft : "transparent",
-                        }}
-                      >
-                        <div className="flex items-start gap-3 px-3 py-2.5">
-                          {sec.key !== "note" ? (
-                            <button
-                              onClick={() => toggle(sec.key, it.id)}
-                              aria-label={it.done ? "mark not done" : "mark done"}
-                              className="mt-0.5 w-5 h-5 rounded-full flex-shrink-0 flex items-center justify-center text-xs focus:outline-none focus-visible:ring-2"
-                              style={{
-                                border: `1.5px solid ${it.done ? C.blue : C.faint}`,
-                                background: it.done ? C.blue : "transparent",
-                                color: "#fff",
+                      <div key={sub.key} style={{ borderTop: `1px solid ${C.cardEdge}` }}>
+                        <div
+                          role="button"
+                          tabIndex={0}
+                          aria-expanded={!sub.collapsed}
+                          aria-label={`${sub.collapsed ? "expand" : "collapse"} ${sub.name}`}
+                          className="group/sub flex items-center gap-2 px-3 py-2 min-h-[36px] cursor-pointer select-none [touch-action:manipulation] focus:outline-none focus-visible:ring-2"
+                          style={{ background: "rgba(255,255,255,0.025)" }}
+                          onClick={(e) => {
+                            const el = e.target.closest && e.target.closest("[data-act]");
+                            const act = el ? el.getAttribute("data-act") : "";
+                            if (act === "rename") { setEditingSub({ sec: sec.key, key: sub.key, value: sub.name }); return; }
+                            if (act === "delete") { requestDeleteSub(sec.key, sub.key); return; }
+                            if (act === "noop") return;
+                            toggleSub(sec.key, sub.key);
+                          }}
+                          onKeyDown={(e) => { if (e.target === e.currentTarget && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); toggleSub(sec.key, sub.key); } }}
+                        >
+                          <span className="font-mono text-xs w-3 flex-shrink-0" style={{ color: C.blue, opacity: sub.collapsed ? 0.5 : 1 }}>{sub.collapsed ? "▸" : "▾"}</span>
+                          {isRenaming ? (
+                            <input
+                              data-act="noop"
+                              autoFocus
+                              value={editingSub.value}
+                              onChange={(e) => setEditingSub({ ...editingSub, value: e.target.value })}
+                              onKeyDown={(e) => {
+                                if (e.key === "Enter") commitSubRename();
+                                else if (e.key === "Escape") setEditingSub(null);
                               }}
-                            >
-                              {it.done ? "✓" : ""}
-                            </button>
+                              onBlur={commitSubRename}
+                              aria-label={`rename ${sub.name}`}
+                              className="flex-1 min-w-0 text-xs font-bold tracking-widest outline-none rounded-md px-2 py-1"
+                              style={{ ...inputStyle, border: `1px solid ${C.blue}` }}
+                            />
                           ) : (
-                            <span className="mt-0.5 w-5 flex-shrink-0 text-center" style={{ color: C.faint }}>·</span>
+                            <span className="flex-1 min-w-0 truncate text-xs font-bold tracking-widest" style={{ color: C.dim }}>{sub.name}</span>
                           )}
-                          <div className="flex-1 min-w-0">
-                            {isEditing ? (
-                              <div
-                                onBlur={(e) => { if (!e.currentTarget.contains(e.relatedTarget)) commitItemEdit(); }}
-                              >
-                                <input
-                                  autoFocus
-                                  value={editing.text}
-                                  onChange={(e) => setEditing({ ...editing, text: e.target.value })}
-                                  onKeyDown={(e) => {
-                                    if (e.key === "Enter") commitItemEdit();
-                                    else if (e.key === "Escape") cancelItemEdit();
-                                  }}
-                                  className="w-full text-sm leading-snug outline-none rounded-md px-2 py-1"
-                                  style={{ background: C.bg, color: C.text, border: `1px solid ${C.blue}` }}
-                                />
-                                <input
-                                  value={editing.next}
-                                  onChange={(e) => setEditing({ ...editing, next: e.target.value })}
-                                  onKeyDown={(e) => {
-                                    if (e.key === "Enter") commitItemEdit();
-                                    else if (e.key === "Escape") cancelItemEdit();
-                                  }}
-                                  placeholder="→ next step — optional"
-                                  aria-label="next step"
-                                  className="w-full mt-1.5 text-xs outline-none rounded-md px-2 py-1"
-                                  style={{ background: C.bg, color: C.text, border: `1px solid ${C.cardEdge}` }}
-                                />
-                                <input
-                                  value={editing.url}
-                                  onChange={(e) => setEditing({ ...editing, url: e.target.value })}
-                                  onKeyDown={(e) => {
-                                    if (e.key === "Enter") commitItemEdit();
-                                    else if (e.key === "Escape") cancelItemEdit();
-                                  }}
-                                  placeholder="link — leave empty for none"
-                                  className="w-full mt-1.5 text-xs font-mono outline-none rounded-md px-2 py-1"
-                                  style={{ background: C.bg, color: C.blue, border: `1px solid ${C.cardEdge}` }}
-                                />
-                              </div>
-                            ) : (
-                              <>
-                                <button
-                                  onClick={() => handleItemClick(it.id)}
-                                  onDoubleClick={() => handleItemDblClick(sec.key, it)}
-                                  className="text-left w-full text-sm leading-snug focus:outline-none"
-                                  style={{
-                                    color: it.done ? C.faint : C.text,
-                                    textDecoration: it.done ? "line-through" : "none",
-                                  }}
-                                >
-                                  {it.text}
-                                </button>
-                                {it.next && (
-                                  <div className="text-xs mt-0.5" style={{ color: C.dim }}>→ {it.next}</div>
-                                )}
-                                {it.url && (
-                                  <a
-                                    href={it.url}
-                                    target="_blank"
-                                    rel="noreferrer"
-                                    className="inline-block mt-0.5 text-xs font-mono"
-                                    style={{ color: C.blue }}
-                                  >
-                                    link ↗
-                                  </a>
-                                )}
-                                {openItem === it.id && (
-                                  <div className="flex items-center gap-2 mt-2 mb-1">
-                                    <select
-                                      value={sec.key}
-                                      onChange={(e) => move(sec.key, it.id, e.target.value)}
-                                      className="text-xs font-mono rounded-md px-2 py-1 focus:outline-none"
-                                      style={{ background: C.bg, color: C.text, border: `1px solid ${C.cardEdge}` }}
-                                    >
-                                      {data.sections.map((s) => (
-                                        <option key={s.key} value={s.key}>{s.glyph} {labelFor(s.key).toLowerCase()}</option>
-                                      ))}
-                                    </select>
-                                    <button
-                                      onClick={() => startEdit(sec.key, it)}
-                                      className="text-xs font-mono px-2 py-1 rounded-md focus:outline-none focus-visible:ring-2"
-                                      style={{ color: C.blue, border: `1px solid ${C.cardEdge}` }}
-                                    >
-                                      edit
-                                    </button>
-                                    <button
-                                      onClick={() => remove(sec.key, it.id)}
-                                      className="text-xs font-mono px-2 py-1 rounded-md focus:outline-none focus-visible:ring-2"
-                                      style={{ color: C.red, border: `1px solid ${C.cardEdge}` }}
-                                    >
-                                      delete
-                                    </button>
-                                  </div>
-                                )}
-                              </>
-                            )}
-                          </div>
+                          <span className="font-mono text-xs flex-shrink-0" style={{ color: C.faint }}>
+                            {sec.key === "note" ? `${subItems.length}` : `${subOpen} open`}
+                          </span>
+                          {!isRenaming && (
+                            <span className={`flex items-center gap-1 flex-shrink-0 ${REVEAL_SUB}`}>
+                              <button data-act="rename" aria-label={`rename ${sub.name}`} className="text-xs px-1.5 py-1 rounded-md focus:outline-none focus-visible:ring-2" style={{ color: C.dim, background: "transparent" }}>✎</button>
+                              <button data-act="delete" aria-label={`delete ${sub.name}`} className="text-xs px-1.5 py-1 rounded-md focus:outline-none focus-visible:ring-2" style={{ color: C.red, background: "transparent" }}>🗑</button>
+                            </span>
+                          )}
                         </div>
+                        {isPendingDelete && (
+                          <div className="flex items-center gap-2 px-3 pb-2 flex-wrap" style={{ background: "rgba(255,255,255,0.025)" }}>
+                            <span className="font-mono text-xs" style={{ color: C.dim }}>delete "{sub.name}"? its {subItems.length} item{subItems.length === 1 ? "" : "s"} move back to {displayLabel}.</span>
+                            <button onClick={() => deleteSub(sec.key, sub.key)} className="font-mono text-xs px-2 py-1 rounded-md focus:outline-none focus-visible:ring-2" style={{ color: C.red, border: `1px solid ${C.red}`, background: "transparent" }}>yes, delete</button>
+                            <button onClick={() => setPendingDeleteSub(null)} className="font-mono text-xs px-2 py-1 rounded-md focus:outline-none focus-visible:ring-2" style={{ color: C.dim, border: `1px solid ${C.cardEdge}`, background: "transparent" }}>cancel</button>
+                          </div>
+                        )}
+                        <Collapsible open={!sub.collapsed}>
+                          {subItems.length === 0 && (
+                            <div className="px-4 py-3 text-xs" style={{ color: C.faint, borderTop: `1px solid ${C.cardEdge}` }}>empty — add one below</div>
+                          )}
+                          {subItems.map((it, idx) => renderItem(sec, it, idx === 0 ? 1 : idx))}
+                          {renderQuickAdd(sec.key, sub.key, `${displayLabel} › ${sub.name}`)}
+                        </Collapsible>
                       </div>
                     );
                   })}
-                  {/* quick add */}
-                  {addingItem === sec.key ? (
-                    <div
-                      className="px-3 py-2.5"
-                      style={{ borderTop: `1px solid ${C.cardEdge}` }}
-                      onBlur={(e) => { if (!e.currentTarget.contains(e.relatedTarget)) commitNewItem(false); }}
-                    >
+
+                  {/* new subsection */}
+                  {addingSub === sec.key && (
+                    <div className="px-3 py-2.5" style={{ borderTop: `1px solid ${C.cardEdge}` }}>
                       <input
-                        ref={addItemInputRef}
                         autoFocus
-                        value={newItem.text}
-                        onChange={(e) => setNewItem({ ...newItem, text: e.target.value })}
+                        value={newSubName}
+                        onChange={(e) => setNewSubName(e.target.value)}
                         onKeyDown={(e) => {
-                          if (e.key === "Enter") commitNewItem(true);
-                          else if (e.key === "Escape") closeNewItem();
+                          if (e.key === "Enter") commitNewSub();
+                          else if (e.key === "Escape") closeNewSub();
                         }}
-                        placeholder="new item — enter to add another"
-                        aria-label={`new item in ${displayLabel}`}
-                        className="w-full text-sm leading-snug outline-none rounded-md px-2 py-1"
-                        style={{ background: C.bg, color: C.text, border: `1px solid ${C.blue}` }}
-                      />
-                      <input
-                        value={newItem.url}
-                        onChange={(e) => setNewItem({ ...newItem, url: e.target.value })}
-                        onKeyDown={(e) => {
-                          if (e.key === "Enter") commitNewItem(true);
-                          else if (e.key === "Escape") closeNewItem();
-                        }}
-                        placeholder="link — optional"
-                        aria-label={`new item link in ${displayLabel}`}
-                        className="w-full mt-1.5 text-xs font-mono outline-none rounded-md px-2 py-1"
-                        style={{ background: C.bg, color: C.blue, border: `1px solid ${C.cardEdge}` }}
+                        onBlur={commitNewSub}
+                        placeholder="subsection name — enter to create, esc to cancel"
+                        aria-label={`new subsection in ${displayLabel}`}
+                        className="w-full text-xs font-bold tracking-widest outline-none rounded-md px-2 py-1.5"
+                        style={{ ...inputStyle, border: `1px solid ${C.blue}` }}
                       />
                     </div>
-                  ) : (
-                    <button
-                      onClick={() => { setAddingItem(sec.key); setNewItem({ text: "", url: "" }); }}
-                      aria-label={`add item to ${displayLabel}`}
-                      className="w-full text-center font-mono text-xs py-2 focus:outline-none focus-visible:ring-2"
-                      style={{ color: C.blue, background: "transparent", borderTop: `1px solid ${C.cardEdge}` }}
-                    >
-                      ＋ add item
-                    </button>
                   )}
                 </div>
-              )}
+              </Collapsible>
             </div>
           );
         })}
@@ -834,13 +990,29 @@ export default function ActFromHere() {
           </div>
           {managerOpen && (
             <div className="rounded-2xl overflow-hidden mt-3" style={{ background: C.card, border: `1px solid ${C.cardEdge}` }}>
+              <div className="px-3 pt-2.5 pb-1 font-mono text-xs" style={{ color: C.faint }}>▲ ▼ set the order on the page · double-click a name up top to rename</div>
               {data.sections.map((s, idx) => {
                 const count = (data.items[s.key] || []).length;
                 const name = labelFor(s.key);
                 const deletable = count === 0;
+                const first = idx === 0;
+                const last = idx === data.sections.length - 1;
+                const arrow = (dir, disabled, label) => (
+                  <button
+                    disabled={disabled}
+                    onClick={() => !disabled && moveSection(s.key, dir)}
+                    aria-label={label}
+                    className="flex-shrink-0 w-9 h-9 rounded-md text-sm focus:outline-none focus-visible:ring-2 [touch-action:manipulation]"
+                    style={{ color: disabled ? C.faint : C.blue, border: `1px solid ${C.cardEdge}`, opacity: disabled ? 0.35 : 1, background: "transparent", cursor: disabled ? "default" : "pointer" }}
+                  >
+                    {dir < 0 ? "▲" : "▼"}
+                  </button>
+                );
                 return (
-                  <div key={s.key} className="px-3 py-2.5" style={{ borderTop: idx === 0 ? "none" : `1px solid ${C.cardEdge}` }}>
-                    <div className="flex items-center gap-2.5">
+                  <div key={s.key} className="px-3 py-2" style={{ borderTop: `1px solid ${C.cardEdge}` }}>
+                    <div className="flex items-center gap-2">
+                      {arrow(-1, first, `move ${name} up`)}
+                      {arrow(1, last, `move ${name} down`)}
                       {editingGlyph && editingGlyph.key === s.key ? (
                         <input
                           autoFocus
@@ -853,7 +1025,7 @@ export default function ActFromHere() {
                           onBlur={commitGlyphEdit}
                           aria-label={`glyph for ${name}`}
                           className="w-9 flex-shrink-0 text-center text-sm outline-none rounded-md py-1"
-                          style={{ background: C.bg, border: `1px solid ${C.blue}`, color: C.text }}
+                          style={{ ...inputStyle, border: `1px solid ${C.blue}` }}
                         />
                       ) : (
                         <button
@@ -867,15 +1039,13 @@ export default function ActFromHere() {
                       )}
                       <span className="flex-1 min-w-0 truncate text-sm font-bold tracking-wide" style={{ color: C.text }}>{name}</span>
                       <span className="font-mono text-xs flex-shrink-0" style={{ color: C.faint }}>
-                        {count} item{count === 1 ? "" : "s"}
+                        {count} item{count === 1 ? "" : "s"}{s.subs.length ? ` · ${s.subs.length} sub` : ""}
                       </span>
-                      {!deletable && (
-                        <span className="font-mono text-xs flex-shrink-0" style={{ color: C.faint }}>· clear it out first</span>
-                      )}
                       <button
                         disabled={!deletable}
                         onClick={() => deletable && setPendingDelete(s.key)}
                         aria-label={`delete ${name}`}
+                        title={deletable ? "" : "clear it out first"}
                         className="flex-shrink-0 text-sm px-2 py-1 rounded-md focus:outline-none focus-visible:ring-2"
                         style={{
                           color: deletable ? C.red : C.faint,
@@ -920,7 +1090,7 @@ export default function ActFromHere() {
                       placeholder="✦"
                       aria-label="new section glyph"
                       className="w-9 flex-shrink-0 text-center text-sm outline-none rounded-md py-1"
-                      style={{ background: C.bg, border: `1px solid ${C.cardEdge}`, color: C.text }}
+                      style={inputStyle}
                     />
                     <input
                       autoFocus
@@ -933,7 +1103,7 @@ export default function ActFromHere() {
                       placeholder="section name"
                       aria-label="new section name"
                       className="flex-1 min-w-0 text-sm outline-none rounded-md px-2 py-1"
-                      style={{ background: C.bg, border: `1px solid ${C.cardEdge}`, color: C.text }}
+                      style={inputStyle}
                     />
                     <button
                       onClick={addSection}
@@ -975,7 +1145,7 @@ export default function ActFromHere() {
       {/* toast */}
       {toast && (
         <div
-          className="fixed bottom-5 left-1/2 -translate-x-1/2 px-4 py-2 rounded-full text-sm font-medium shadow-lg"
+          className="fixed bottom-[max(1.25rem,env(safe-area-inset-bottom))] left-1/2 -translate-x-1/2 px-4 py-2 rounded-full text-sm font-medium shadow-lg"
           style={{ background: C.card, color: C.text, border: `1px solid ${C.cardEdge}` }}
         >
           {toast}

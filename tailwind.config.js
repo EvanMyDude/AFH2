@@ -1,1 +1,6 @@
-module.exports = { content: ["./src/*.jsx"], theme: { extend: {} }, corePlugins: { preflight: true } };
+module.exports = {
+  content: ["./src/*.{jsx,js}"],
+  future: { hoverOnlyWhenSupported: true },
+  theme: { extend: {} },
+  corePlugins: { preflight: true },
+};

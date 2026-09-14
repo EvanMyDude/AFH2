@@ -1,6 +1,7 @@
 {
-  "name": "Act From Here",
-  "short_name": "AFH",
+  "id": "/AFH2/",
+  "name": "Act From Here 2",
+  "short_name": "AFH2",
   "description": "The small surface you actually trust.",
   "start_url": "./",
   "scope": "./",
