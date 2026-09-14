@@ -25,14 +25,25 @@ Live: https://evanmydude.github.io/AFH2/
 AFH2 stores its data under its own keys (`afh2-*`) and its own private gist
 (`afh2-data`). It never writes to the old app's data or gist.
 
-1. **Open AFH2 on the desktop browser where you used the original app first.**
-   Both apps live on `evanmydude.github.io`, so AFH2 finds the old data, migrates
-   it, seeds Big Ticket, and (if your GitHub token is set) pushes to the new gist.
-2. **On the iPhone**, add https://evanmydude.github.io/AFH2/ to the Home Screen.
-   iOS gives every home-screen web app its own isolated storage, so it starts
-   empty: open ⇄ and paste your GitHub token → it adopts what the desktop pushed.
-3. Anything else: **export** from the old app (⇄ → export) and **import** into AFH2.
-   Old backups are accepted and migrated.
+**Where is your data right now?** Almost certainly on the iPhone (the installed
+Act From Here app has its own isolated storage) and, if you ever pasted a GitHub
+token there, in the old app's gist. A desktop browser that never ran the old app
+has nothing to migrate and AFH2 will simply start with its defaults there.
+
+Pick the path that matches:
+
+- **Old app has a GitHub token (phone syncs to a gist):** on the desktop, open
+  https://evanmydude.github.io/ActFromHere/ once, paste the same token into its ⇄
+  panel → it pulls your data. Then open https://evanmydude.github.io/AFH2/ on the
+  same desktop → AFH2 imports it, seeds Big Ticket, and (with the token) pushes to
+  the new gist. It does this even if you already visited AFH2 there, as long as
+  you haven't edited anything in it yet. On the iPhone, add AFH2 to the Home
+  Screen, open ⇄, paste the token → it adopts what the desktop pushed.
+- **No token (phone only):** in the old app on the phone, ⇄ → **export** (saves a
+  JSON file to Files). Add AFH2 to the Home Screen, open ⇄ → **import** that file.
+  Done — Big Ticket is seeded on import. Optionally paste a token afterwards for
+  cross-device sync.
+- **Desktop browser that already has the old app's data:** just open AFH2 there.
 
 The original app keeps working untouched. Just stop using it once you've moved.
 
