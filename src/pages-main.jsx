@@ -350,9 +350,16 @@ const askRetry = (mount, message) => new Promise((resolve) => {
   mount.append(wrap);
 });
 
+// Runs on a true first boot, and again while AFH2 still holds the UNTOUCHED
+// default seed (watermark 1 = never edited, never pushed): if the original
+// app's data shows up in this browser later — e.g. the user opened the old app
+// here to pull its gist after AFH2 had already been visited — it is imported
+// then. Nothing real can be overwritten because watermark 1 means no edits.
+export const isUntouchedDefault = () => localStorage.getItem(DATA_KEY) !== null && getMeta().savedAt === 1 && getMeta().pushedAt === 1;
+
 export async function firstBoot(mount) {
-  if (localStorage.getItem(DATA_KEY) !== null) return;
   const legacyRaw = localStorage.getItem(LEGACY_DATA_KEY);
+  if (localStorage.getItem(DATA_KEY) !== null && !(isUntouchedDefault() && legacyRaw !== null)) return;
   if (localStorage.getItem(K_GH_TOKEN)) {
     // AFH2 gist first: if this account already migrated elsewhere, that lineage wins.
     for (;;) {
