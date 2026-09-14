@@ -1,0 +1,22 @@
+{
+  "name": "afh2",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Act From Here 2 — the small surface you actually trust. Static PWA for GitHub Pages.",
+  "scripts": {
+    "build:css": "tailwindcss -c tailwind.config.js -i tw-in.css -o styles.css --minify",
+    "build:js": "esbuild src/pages-main.jsx --bundle --jsx=automatic --define:process.env.NODE_ENV='\"production\"' --minify --format=iife --outfile=app.js",
+    "build": "npm run build:css && npm run build:js",
+    "test": "node --test test/",
+    "serve": "python3 -m http.server 8787"
+  },
+  "dependencies": {
+    "react": "19.3.0",
+    "react-dom": "19.3.0"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2",
+    "tailwindcss": "3.4.19"
+  }
+}
