@@ -3,26 +3,22 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <title>Act From Here.</title>
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https://api.anthropic.com https://api.github.com; worker-src 'self'; manifest-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'" />
+  <title>Act From Here 2.</title>
   <meta name="theme-color" content="#0A0A0B" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-  <meta name="apple-mobile-web-app-title" content="AFH" />
+  <meta name="apple-mobile-web-app-title" content="AFH2" />
   <link rel="manifest" href="./manifest.webmanifest" />
   <link rel="apple-touch-icon" href="./icon-192.png" />
   <link rel="icon" href="./icon-192.png" />
   <link rel="stylesheet" href="./styles.css" />
-  <style>html,body{background:#0A0A0B;margin:0}#root{min-height:100vh}</style>
+  <style>html,body{background:#0A0A0B;margin:0}#root{min-height:100vh;min-height:100dvh}</style>
 </head>
 <body>
   <div id="root"></div>
   <noscript style="color:#9A9AA3;font-family:monospace;display:block;padding:2rem">Act From Here needs JavaScript.</noscript>
-  <script>
-    if ("serviceWorker" in navigator) {
-      addEventListener("load", () => navigator.serviceWorker.register("./sw.js").catch(console.error));
-    }
-  </script>
   <script src="./app.js"></script>
 </body>
 </html>

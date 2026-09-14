@@ -8,7 +8,7 @@
     "build:css": "tailwindcss -c tailwind.config.js -i tw-in.css -o styles.css --minify",
     "build:js": "esbuild src/pages-main.jsx --bundle --jsx=automatic --define:process.env.NODE_ENV='\"production\"' --minify --format=iife --outfile=app.js",
     "build": "npm run build:css && npm run build:js",
-    "test": "node --test test/",
+    "test": "node --test \"test/**/*.test.js\"",
     "serve": "python3 -m http.server 8787"
   },
   "dependencies": {
