@@ -35,14 +35,25 @@ const REVEAL = "opacity-70 [@media(hover:hover)_and_(pointer:fine)]:opacity-0 tr
 const REVEAL_SEC = REVEAL + " group-hover:opacity-100 group-focus-within:opacity-100";
 const REVEAL_SUB = REVEAL + " group-hover/sub:opacity-100 group-focus-within/sub:opacity-100";
 
+// Touch-only sizing (pointer:coarse) so small controls get ~40 px targets on the
+// phone while mouse layouts stay pixel-identical. Equal padding/negative margin
+// grows the hit area without moving neighbours where the row has room for it.
+const TOUCH_TALL = "[@media(pointer:coarse)]:min-h-[40px]";
+const TOUCH_ICON = "[@media(pointer:coarse)]:min-w-[40px] [@media(pointer:coarse)]:py-3 [@media(pointer:coarse)]:-my-2";
+// Bordered chips can't grow visibly; an invisible ::after extends the tap area instead.
+// (8 px below stops just short of the section card, 10 px above is free space.)
+const TOUCH_CHIP = "relative after:absolute after:inset-x-0 after:-top-2.5 after:-bottom-2 after:content-['']";
+
 // Smooth open/close with unknown content height and no unmount: grid rows 0fr↔1fr.
 // overflow-clip (not hidden) so a focused child can't scroll the box on iOS;
 // contain:layout avoids a Safari end-of-transition flicker; inert removes the
-// collapsed content from tab order and taps.
+// collapsed content from tab order and taps. min-w-0 keeps the content's
+// min-content width (e.g. a long subsection name, which truncates) from
+// stretching the card past the column on a phone.
 function Collapsible({ open, children }) {
   return (
     <div className="grid transition-[grid-template-rows] duration-200 ease-out motion-reduce:transition-none" style={{ gridTemplateRows: open ? "1fr" : "0fr" }}>
-      <div className="min-h-0 overflow-clip [contain:layout]" inert={!open}>{children}</div>
+      <div className="min-h-0 min-w-0 overflow-clip [contain:layout]" inert={!open}>{children}</div>
     </div>
   );
 }
@@ -87,6 +98,8 @@ export default function ActFromHere() {
   const dirty = useRef(false);     // state changed while writing
   const clickTimer = useRef(null); // single-vs-double click disambiguation
   const dumpRef = useRef(dump);    // live PASTE DUMP text (a sort in flight compares against it)
+  const lastPointer = useRef("");  // pointerType of the latest pointerdown on an item's text
+  const menuOpened = useRef({ id: null, t: 0 }); // when a touch tap last opened a menu
 
   const cur = () => latest.current;
   const labelFor = (key) => {
@@ -464,8 +477,22 @@ export default function ActFromHere() {
   const cancelItemEdit = () => { editingRef.current = null; setEditing(null); };
 
   // ---------- click vs double-click on item text ----------
+  // Only a mouse waits CLICK_DELAY for a possible double click. Touch, pen and
+  // keyboard open the menu at once (its "edit" button covers editing); a second
+  // tap inside the window is a double-tap, so it must not close the menu it just
+  // opened, and the dblclick that follows still edits.
   const handleItemClick = (id) => {
     if (editing && editing.id === id) return;
+    const mouse = lastPointer.current === "mouse";
+    lastPointer.current = "";
+    if (!mouse) {
+      if (clickTimer.current) { clearTimeout(clickTimer.current); clickTimer.current = null; }
+      if (menuOpened.current.id === id && Date.now() - menuOpened.current.t < CLICK_DELAY) return;
+      if (openItem === id) { setOpenItem(null); return; }
+      menuOpened.current = { id, t: Date.now() };
+      setOpenItem(id);
+      return;
+    }
     if (clickTimer.current) clearTimeout(clickTimer.current);
     clickTimer.current = setTimeout(() => {
       clickTimer.current = null;
@@ -685,17 +712,22 @@ export default function ActFromHere() {
       >
         <div className="flex items-start gap-3 px-3 py-2.5">
           {sec.key !== "note" ? (
+            // 40×40 hit area around the 20×20 circle; the equal negative margin keeps the layout unchanged
             <button
               onClick={() => toggle(sec.key, it.id)}
               aria-label={it.done ? "mark not done" : "mark done"}
-              className="mt-0.5 w-5 h-5 rounded-full flex-shrink-0 flex items-center justify-center text-xs focus:outline-none focus-visible:ring-2"
-              style={{
-                border: `1.5px solid ${it.done ? C.blue : C.faint}`,
-                background: it.done ? C.blue : "transparent",
-                color: "#fff",
-              }}
+              className="group/cb -m-2.5 p-2.5 flex-shrink-0 focus:outline-none [touch-action:manipulation]"
             >
-              {it.done ? "✓" : ""}
+              <span
+                className="mt-0.5 w-5 h-5 rounded-full flex items-center justify-center text-xs group-focus-visible/cb:ring-2"
+                style={{
+                  border: `1.5px solid ${it.done ? C.blue : C.faint}`,
+                  background: it.done ? C.blue : "transparent",
+                  color: "#fff",
+                }}
+              >
+                {it.done ? "✓" : ""}
+              </span>
             </button>
           ) : (
             <span className="mt-0.5 w-5 flex-shrink-0 text-center" style={{ color: C.faint }}>·</span>
@@ -741,6 +773,7 @@ export default function ActFromHere() {
             ) : (
               <>
                 <button
+                  onPointerDown={(e) => { lastPointer.current = e.pointerType; }}
                   onClick={() => handleItemClick(it.id)}
                   onDoubleClick={() => handleItemDblClick(sec.key, it)}
                   className="text-left w-full text-sm leading-snug focus:outline-none"
@@ -767,7 +800,7 @@ export default function ActFromHere() {
                       value={position}
                       onChange={(e) => move(sec.key, it.id, e.target.value)}
                       aria-label="move to"
-                      className="text-xs font-mono rounded-md px-2 py-1 focus:outline-none max-w-full"
+                      className={`text-xs font-mono rounded-md px-2 py-1 focus:outline-none max-w-full ${TOUCH_TALL}`}
                       style={inputStyle}
                     >
                       {data.sections.map((s) => (
@@ -781,14 +814,14 @@ export default function ActFromHere() {
                     </select>
                     <button
                       onClick={() => startEdit(sec.key, it)}
-                      className="text-xs font-mono px-2 py-1 rounded-md focus:outline-none focus-visible:ring-2"
+                      className={`text-xs font-mono px-2 py-1 rounded-md focus:outline-none focus-visible:ring-2 ${TOUCH_TALL}`}
                       style={{ color: C.blue, border: `1px solid ${C.cardEdge}` }}
                     >
                       edit
                     </button>
                     <button
                       onClick={() => remove(sec.key, it.id)}
-                      className="text-xs font-mono px-2 py-1 rounded-md focus:outline-none focus-visible:ring-2"
+                      className={`text-xs font-mono px-2 py-1 rounded-md focus:outline-none focus-visible:ring-2 ${TOUCH_TALL}`}
                       style={{ color: C.red, border: `1px solid ${C.cardEdge}` }}
                     >
                       delete
@@ -892,10 +925,11 @@ export default function ActFromHere() {
                     onClick={() => toggleCollapse(sec.key)}
                     aria-expanded={!isCollapsed}
                     aria-label={`${isCollapsed ? "expand" : "collapse"} ${displayLabel}`}
-                    className="focus:outline-none focus-visible:ring-2 [touch-action:manipulation]"
+                    className="group/gl -my-2.5 py-2.5 -ml-3 pl-3 -mr-1.5 pr-1.5 focus:outline-none [touch-action:manipulation]"
                     style={{ color: C.blue, opacity: isCollapsed ? 0.5 : 1, background: "transparent" }}
                   >
-                    {sec.glyph}
+                    {/* the padding/negative margin above grows the hit area without moving anything; the ring stays on the glyph */}
+                    <span className="group-focus-visible/gl:ring-2">{sec.glyph}</span>
                   </button>
                   {editingCat && editingCat.key === sec.key ? (
                     <input
@@ -918,7 +952,7 @@ export default function ActFromHere() {
                   <button
                     onClick={() => { if (addingSub === sec.key) closeNewSub(); else { openNewSub(sec.key); if (isCollapsed) toggleCollapse(sec.key); } }}
                     aria-label={`add subsection to ${displayLabel}`}
-                    className={`font-mono text-xs px-2 py-1 rounded-md focus:outline-none focus-visible:ring-2 [touch-action:manipulation] ${REVEAL_SEC}`}
+                    className={`font-mono text-xs px-2 py-1 rounded-md focus:outline-none focus-visible:ring-2 [touch-action:manipulation] ${TOUCH_CHIP} ${REVEAL_SEC}`}
                     style={{ color: C.blue, border: `1px solid ${C.cardEdge}`, background: "transparent" }}
                   >
                     ＋ subsection
@@ -987,8 +1021,8 @@ export default function ActFromHere() {
                           </span>
                           {!isRenaming && (
                             <span className={`flex items-center gap-1 flex-shrink-0 ${REVEAL_SUB}`}>
-                              <button data-act="rename" aria-label={`rename ${sub.name}`} className="text-xs px-1.5 py-1 rounded-md focus:outline-none focus-visible:ring-2" style={{ color: C.dim, background: "transparent" }}>✎</button>
-                              <button data-act="delete" aria-label={`delete ${sub.name}`} className="text-xs px-1.5 py-1 rounded-md focus:outline-none focus-visible:ring-2" style={{ color: C.red, background: "transparent" }}>🗑</button>
+                              <button data-act="rename" aria-label={`rename ${sub.name}`} className={`text-xs px-1.5 py-1 rounded-md focus:outline-none focus-visible:ring-2 ${TOUCH_ICON}`} style={{ color: C.dim, background: "transparent" }}>✎</button>
+                              <button data-act="delete" aria-label={`delete ${sub.name}`} className={`text-xs px-1.5 py-1 rounded-md focus:outline-none focus-visible:ring-2 ${TOUCH_ICON}`} style={{ color: C.red, background: "transparent" }}>🗑</button>
                             </span>
                           )}
                         </div>
