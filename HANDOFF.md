@@ -9,7 +9,7 @@ Read this first in a fresh session. It says what exists, how it fits together, w
 | Live | https://evanmydude.github.io/AFH2/ (GitHub Pages, deploy-from-branch, `main`, folder `/`) |
 | Repo | https://github.com/EvanMyDude/AFH2 — local checkout `~/Desktop/AFH2`, branch `main` |
 | Predecessor | https://github.com/EvanMyDude/ActFromHere → https://evanmydude.github.io/ActFromHere/ (untouched, still live) |
-| Shipped | PR #1 (feature + review fixes, with walkthrough GIF), PR #2 (legacy-import self-heal). Both merged. |
+| Shipped | PR #1 (feature + review fixes, with walkthrough GIF), PR #2 (legacy-import self-heal). Both merged. 2026-10-03 batch (branch `claude/gracious-dirac-0b68c3`, one PR): paste-dump draft survives relaunch, instant item menu on touch + ~40 px touch targets, undo for delete / clear done / move / Sort It (§2). |
 | Tests | `npm test` → 26 passing (`node:test`, no browser) |
 | Build | `app.js` and `styles.css` are **committed build outputs**; the live bundle hash was verified equal to the local build |
 | Verified | Migration from the old app's data, all subsection flows, reordering, corrupt-data guard, Esc/collapse form semantics — in headless Chromium against fixtures. Live site loads clean with CSP. |
@@ -24,6 +24,11 @@ Act From Here 2 is the original single-page React PWA (paste-dump sorter + secti
 - **Section ordering** via ▲ ▼ in the existing ⚙ sections manager.
 - **Big Ticket seed**: 74 items from `big ticket.pdf` with stable ids (`bt-001…`) into subsections BIG TICKET (THIS WEEK, DECISIONS, KEEPERS), SYSTEMS / IDEAS WORTH A REAL LOOK / BODY / PEOPLE (CIRCLE BACK), NORTH STAR (KEEPERS), and a new top-level **THIS MONTH** section. Applied once on top of existing data; deletions stick. "EVERYTHING ELSE" intentionally omitted. No invented links.
 - **Hardening**: separate storage keys and gist from the old app, lossless sanitizing migration, single writer for the persisted form, corrupt-data guard, timestamp clamp, validated remote adoption, freeze flag around reload-after-adopt, synchronous flush before hide/adoption, serialized push/adopt, gist reconciliation and pagination, URL allow-list, CSP, scope-limited service worker.
+
+**2026-10-03 batch** (all UI-only; no change to `model.js`, the storage keys, the sync engine or the persisted shape; each change passed the no-op upgrade test in §6):
+- PASTE DUMP text is mirrored to the local-only `afh2-dump-draft`, so it survives iOS killing the app and adoption reloads; a sort clears only what it sorted.
+- On touch the item menu opens on tap (the 220 ms double-click wait is mouse-only); checkbox, section glyph, menu controls, subsection ✎/🗑 and "＋ subsection" have ~40 px touch areas; desktop renders identically. `Collapsible` gained `min-w-0`, fixing cards that a long subsection name widened past the phone screen.
+- Undo (6 s toast) for item delete, clear done, move and Sort It.
 
 Depth: `docs/plans/2026-09-14-feat-afh2-subsections-big-ticket-plan.md` (design + every decision and its reason), `todos/` (ten review findings, all resolved, each with the reasoning), PR #1 description.
 
@@ -75,6 +80,7 @@ AFH2/
 - **`afh:flush` listener** (registered once, calls `onFlushRef`): commits every open form, cancels the debounce, and writes directly through `storage.set` if the serialized state differs from what is stored. The sync layer dispatches this event synchronously before reading meta on hide/pagehide and before any adoption.
 - **`<Collapsible open>`**: `grid` + `grid-template-rows 0fr↔1fr` transition, inner `min-h-0 min-w-0 overflow-clip [contain:layout]` with `inert={!open}`. Used for sections and subsections. `min-w-0` matters: without it the content's min-content width (a long subsection name, before truncation) widened the card past the column on a phone (a 66-character name made the page 716 px wide at 390 px).
 - **Item tap vs double-click:** `onPointerDown` on the item text records `pointerType`. Only a mouse keeps the `CLICK_DELAY` (220 ms) wait that separates single click (menu) from double click (edit). Touch, pen and keyboard open the menu immediately; a second click on the same item within `CLICK_DELAY` of opening is ignored (`menuOpened`), so a double-tap never blinks the menu closed and the `dblclick` that follows still edits. Chromium turns two touch taps up to ~500 ms apart into a `dblclick` (old and new builds alike); what iOS does is a device check.
+- **Undo:** `remove` (item delete), `move`, `clearDone` and Sort It (success and fallback) call `offerUndo(before, msg, dump?)` right after their `persist`. It keeps `{ before, after: serialize(cur()), dump }` and shows the toast with an "undo" button for 6 s. `undo()` restores `before` only while `serialize(cur()) === after` (cosmetic `fresh` changes don't count); `persist` retires a pending undo on any other edit, and a plain `flash` replaces it. Restoring is a normal edit (stamped and pushed); restored items flash; Sort It undo puts the sorted text back in PASTE DUMP. The toast is a `role="status"` region 40 px above the ⇄ button (z-40), so they never overlap.
 - **Touch targets:** checkbox and section-glyph buttons grow their hit area with padding plus an equal negative margin (layout and pixels unchanged); `TOUCH_TALL` / `TOUCH_ICON` apply only under `(pointer:coarse)` (menu select/edit/delete, subsection ✎/🗑 → 40 px); `TOUCH_CHIP` extends "＋ subsection" with an invisible `::after`. Don't put `rounded-full` on an enlarged hit-area button: Chromium hit-tests the rounded shape. The desktop page renders byte-identical to the pre-change build.
 - **Rendering per section:** ungrouped items (no `sub`, or a dangling `sub`) render first, exactly like the original app, then each subsection group in `subs` order. `renderItem` and `renderQuickAdd` are shared by both.
 - Subsection header uses one delegated `onClick` with `data-act` (`rename`/`delete`/`noop`), so inner buttons need no `stopPropagation`. No dblclick on group headers (deliberate).
@@ -117,6 +123,7 @@ Watermark rules (`afh2-meta`): `savedAt = 1` means "untouched default seed" (nev
 10. Every inline form gets a ref mirror cleared synchronously on close; commit functions check the ref first.
 11. Subsection/section keys come from `uid()` prefixed (`s…`, `u…`, or the stable seed keys); keys must satisfy `KEY_RE` and never be `Object.prototype` names.
 12. Local-only UI keys (`afh2-dump-draft`) live outside `afh2-v1`: written only on user input, never on load, never synced, never exported, never read by the sync engine. Anything that must sync goes through `migrate`/`serialize` and needs the owner's OK (`CLAUDE.md`).
+13. Never restore a whole-state snapshot (undo or anything like it) unless the persisted form is still exactly what the action produced (`serialize(cur()) === after`). Otherwise it silently rolls back later edits and syncs that rollback to every device.
 
 ## 6. Dev loop
 

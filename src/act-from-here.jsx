@@ -64,6 +64,7 @@ export default function ActFromHere() {
   const [dump, setDump] = useState(readDraft);
   const [sorting, setSorting] = useState(false);
   const [toast, setToast] = useState("");
+  const [toastUndo, setToastUndo] = useState(false); // the toast carries an "undo" button
   const [saveState, setSaveState] = useState("");
   const [openItem, setOpenItem] = useState(null);
   const [editing, setEditing] = useState(null);         // { sec, id, text, url, next }
@@ -92,6 +93,7 @@ export default function ActFromHere() {
   const onFlushRef = useRef(null);
   const addItemInputRef = useRef(null);
   const toastTimer = useRef(null);
+  const undoRef = useRef(null);    // { before, after, dump } — see offerUndo
   const latest = useRef(null);     // newest state, source of truth for writes AND mutations
   const saveTimer = useRef(null);  // debounce handle
   const busy = useRef(false);      // a write is in flight
@@ -173,6 +175,8 @@ export default function ActFromHere() {
   };
 
   const persist = (next) => {
+    // Any new edit retires the pending undo: undo only ever rolls back the very last action.
+    if (undoRef.current) { undoRef.current = null; setToastUndo(false); }
     setData(next);
     latest.current = next;
     scheduleSave();
@@ -189,11 +193,49 @@ export default function ActFromHere() {
     setData(next);
   };
 
-  const flash = (msg) => {
+  const flash = (msg, undoable) => {
+    if (!undoable) undoRef.current = null; // a toast replaced by another can't be undone any more
     setToast(msg);
+    setToastUndo(!!undoable);
     if (toastTimer.current) clearTimeout(toastTimer.current);
-    toastTimer.current = setTimeout(() => setToast(""), 2600);
+    toastTimer.current = setTimeout(() => { setToast(""); setToastUndo(false); undoRef.current = null; }, undoable ? 6000 : 2600);
   };
+
+  const unflashAll = (delay) => {
+    setTimeout(() => {
+      setLocal((st) => ({ ...st, items: Object.fromEntries(Object.entries(st.items).map(([k, a]) => [k, a.map((x) => (x.fresh ? { ...x, fresh: false } : x))])) }));
+    }, delay);
+  };
+
+  // ---------- undo (delete, clear done, move, Sort It) ----------
+  // Call right after the action's persist with the state from just before it.
+  // The snapshot is only restored while the persisted form is still exactly
+  // what the action produced, so undo can never roll back a later edit.
+  // `dump` = text a sort consumed; undo puts it back in the PASTE DUMP box.
+  const offerUndo = (before, msg, dump) => {
+    const after = cur();
+    if (!before || after === before) return;
+    undoRef.current = { before, after: serialize(after), dump };
+    flash(msg, true);
+  };
+
+  const undo = () => {
+    const u = undoRef.current;
+    if (!u) return;
+    if (serialize(cur()) !== u.after) { flash("can't undo — something changed since"); return; }
+    // Flash whatever comes back or returns to its old place; clear stale flashes.
+    const now = new Map();
+    for (const [k, arr] of Object.entries(cur().items)) for (const it of arr) now.set(it.id, k + "/" + (it.sub || ""));
+    const items = Object.fromEntries(Object.entries(u.before.items).map(([k, arr]) => [k, arr.map((it) => {
+      const back = now.get(it.id) !== k + "/" + (it.sub || "");
+      return back ? { ...it, fresh: true } : it.fresh ? { ...it, fresh: false } : it;
+    })]));
+    persist({ ...u.before, items }); // a normal edit: stamped and synced like any other
+    if (u.dump) { const left = dumpRef.current; changeDump(left.trim() ? u.dump.replace(/\s+$/, "") + "\n" + left : u.dump); }
+    flash("undone");
+    unflashAll(1500);
+  };
+  const shortText = (t) => (t.length > 40 ? t.slice(0, 39) + "…" : t);
 
   // ---------- item ops (all read cur(), never stale closures) ----------
   const toggle = (secKey, id) => {
@@ -203,8 +245,10 @@ export default function ActFromHere() {
 
   const remove = (secKey, id) => {
     const st = cur();
+    const it = (st.items[secKey] || []).find((x) => x.id === id);
     setOpenItem(null);
     persist({ ...st, items: { ...st.items, [secKey]: st.items[secKey].filter((it) => it.id !== id) } });
+    if (it) offerUndo(st, `Deleted “${shortText(it.text)}”`);
   };
 
   const unflash = (secKey, delay) => {
@@ -231,6 +275,8 @@ export default function ActFromHere() {
     items[toSec] = [moved, ...(fromSec === toSec ? without : st.items[toSec])];
     persist({ ...st, items });
     unflash(toSec, 1500);
+    const subName = toSub && ((st.sections.find((s) => s.key === toSec) || { subs: [] }).subs.find((x) => x.key === toSub) || {}).name;
+    offerUndo(st, `Moved to ${labelFor(toSec)}${subName ? " › " + subName : ""}`);
   };
 
   // ---------- quick add (per section or subsection) ----------
@@ -266,7 +312,7 @@ export default function ActFromHere() {
     const n = Object.values(st.items).flat().filter((it) => it.done).length;
     if (!n) return;
     persist({ ...st, items: Object.fromEntries(Object.entries(st.items).map(([k, arr]) => [k, arr.filter((it) => !it.done)])) });
-    flash(`Cleared ${n} — brick by brick 🧱`);
+    offerUndo(st, `Cleared ${n} — brick by brick 🧱`);
   };
 
   // ---------- collapse ----------
@@ -605,10 +651,8 @@ export default function ActFromHere() {
       }
       persist({ ...st, items: nextItems });
       consumeDump(sent);
-      flash(`Sorted ${n} item${n === 1 ? "" : "s"} ⚡`);
-      setTimeout(() => {
-        setLocal((st) => ({ ...st, items: Object.fromEntries(Object.entries(st.items).map(([k, a]) => [k, a.map((x) => (x.fresh ? { ...x, fresh: false } : x))])) }));
-      }, 1800);
+      offerUndo(st, `Sorted ${n} item${n === 1 ? "" : "s"} ⚡`, sent);
+      unflashAll(1800);
     } catch (e) {
       console.error(e);
       const reason = String(e && e.message ? e.message : e).slice(0, 90);
@@ -619,7 +663,7 @@ export default function ActFromHere() {
       const lines = raw.split("\n").map((l) => l.trim()).filter((l) => l && !/^[=^\-\s]+$/.test(l));
       persist({ ...st, items: { ...st.items, [catchAll]: [...lines.map((l) => ({ id: uid(), text: l, done: false, fresh: true })), ...st.items[catchAll]] } });
       consumeDump(sent);
-      flash(`Sort failed (${reason}) — dumped into ${labelFor(catchAll)} as-is, nothing lost`);
+      offerUndo(st, `Sort failed (${reason}) — dumped into ${labelFor(catchAll)} as-is, nothing lost`, sent);
     } finally {
       setSorting(false);
     }
@@ -1236,12 +1280,24 @@ export default function ActFromHere() {
       </div>
 
       {/* toast */}
+      {/* toast — sits above the ⇄ sync button (fixed bottom-right, ~30 px tall) so they never overlap */}
       {toast && (
         <div
-          className="fixed bottom-[max(1.25rem,env(safe-area-inset-bottom))] left-1/2 -translate-x-1/2 px-4 py-2 rounded-full text-sm font-medium shadow-lg"
-          style={{ background: C.card, color: C.text, border: `1px solid ${C.cardEdge}` }}
+          role="status"
+          aria-live="polite"
+          className="fixed z-40 left-1/2 -translate-x-1/2 flex items-center gap-3 px-4 py-2 rounded-full text-sm font-medium shadow-lg w-max"
+          style={{ bottom: "calc(max(14px, env(safe-area-inset-bottom)) + 40px)", maxWidth: "calc(100vw - 28px)", background: C.card, color: C.text, border: `1px solid ${C.cardEdge}` }}
         >
-          {toast}
+          <span className="min-w-0">{toast}</span>
+          {toastUndo && (
+            <button
+              onClick={undo}
+              className="flex-shrink-0 font-mono text-xs font-bold px-3 py-1.5 rounded-full focus:outline-none focus-visible:ring-2 [touch-action:manipulation] [@media(pointer:coarse)]:py-2.5"
+              style={{ color: C.blue, border: `1px solid ${C.blue}`, background: "transparent" }}
+            >
+              undo
+            </button>
+          )}
         </div>
       )}
     </div>
