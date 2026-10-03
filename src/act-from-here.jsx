@@ -1,9 +1,10 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import {
   SECTION_META, SORT_HINTS, MAX_SECTIONS, STORE_KEY, CORRUPT_KEY,
   uid, firstGrapheme, migrate, serialize, seed, catchAllKey, safeHref, has,
 } from "./model.js";
 import { applySeed } from "./seed-big-ticket.js";
+import { placeItem, groupOf } from "./arrange.js";
 
 // ---------- palette (Apple Notes dark, his native habitat) ----------
 const C = {
@@ -25,6 +26,10 @@ const CLICK_DELAY = 220; // ms window separating single click (expand) from doub
 // exported, never read by the sync layer; written only when the box changes.
 const DRAFT_KEY = "afh2-dump-draft";
 const readDraft = () => { try { return localStorage.getItem(DRAFT_KEY) || ""; } catch (e) { return ""; } };
+// Arrange-mode drag handles: React's touch listeners are passive, so iOS
+// scrolling and the long-press callout are blocked with native listeners.
+const preventTouch = (e) => { if (e.cancelable) e.preventDefault(); };
+const AUTOSCROLL_ZONE = 72; // px from the top/bottom edge where a drag scrolls the page
 const metaLabel = (key) => (has(SECTION_META, key) ? SECTION_META[key].label : "UNTITLED");
 const metaHint = (key) => (has(SECTION_META, key) ? SECTION_META[key].hint : "nothing here yet");
 
@@ -65,6 +70,8 @@ export default function ActFromHere() {
   const [sorting, setSorting] = useState(false);
   const [toast, setToast] = useState("");
   const [toastUndo, setToastUndo] = useState(false); // the toast carries an "undo" button
+  const [arranging, setArranging] = useState(false);  // Arrange mode (local UI state, never persisted)
+  const [dragId, setDragId] = useState(null);         // item being dragged (dims its row)
   const [saveState, setSaveState] = useState("");
   const [openItem, setOpenItem] = useState(null);
   const [editing, setEditing] = useState(null);         // { sec, id, text, url, next }
@@ -93,7 +100,12 @@ export default function ActFromHere() {
   const onFlushRef = useRef(null);
   const addItemInputRef = useRef(null);
   const toastTimer = useRef(null);
-  const undoRef = useRef(null);    // { before, after, dump } — see offerUndo
+  const undoRef = useRef(null);    // { before, after, dump, ids } — see offerUndo
+  const drag = useRef(null);       // live drag: pointer, target, rAF; no React renders per move
+  const dragFns = useRef({});      // current-render drag handlers (reassigned every render)
+  const dragListeners = useRef(null); // stable wrappers, so add/removeEventListener match
+  const ghostRef = useRef(null);
+  const safeProbeRef = useRef(null);
   const latest = useRef(null);     // newest state, source of truth for writes AND mutations
   const saveTimer = useRef(null);  // debounce handle
   const busy = useRef(false);      // a write is in flight
@@ -212,10 +224,11 @@ export default function ActFromHere() {
   // The snapshot is only restored while the persisted form is still exactly
   // what the action produced, so undo can never roll back a later edit.
   // `dump` = text a sort consumed; undo puts it back in the PASTE DUMP box.
-  const offerUndo = (before, msg, dump) => {
+  // `ids` = items to highlight on undo even if they stay in the same list (reorders).
+  const offerUndo = (before, msg, dump, ids) => {
     const after = cur();
     if (!before || after === before) return;
-    undoRef.current = { before, after: serialize(after), dump };
+    undoRef.current = { before, after: serialize(after), dump, ids };
     flash(msg, true);
   };
 
@@ -227,7 +240,7 @@ export default function ActFromHere() {
     const now = new Map();
     for (const [k, arr] of Object.entries(cur().items)) for (const it of arr) now.set(it.id, k + "/" + (it.sub || ""));
     const items = Object.fromEntries(Object.entries(u.before.items).map(([k, arr]) => [k, arr.map((it) => {
-      const back = now.get(it.id) !== k + "/" + (it.sub || "");
+      const back = now.get(it.id) !== k + "/" + (it.sub || "") || (u.ids && u.ids.includes(it.id));
       return back ? { ...it, fresh: true } : it.fresh ? { ...it, fresh: false } : it;
     })]));
     persist({ ...u.before, items }); // a normal edit: stamped and synced like any other
@@ -583,6 +596,211 @@ export default function ActFromHere() {
     return () => window.removeEventListener("afh:flush", onFlush);
   }, []);
 
+  // ---------- Arrange mode: drag ≡ to reorder or file items ----------
+  // Entering lands every open form (same guarded commits as afh:flush) and
+  // closes menus; nothing about the mode itself is persisted.
+  const startArrange = () => {
+    if (editingRef.current) commitItemEdit();
+    if (editingCatRef.current) commitCatEdit();
+    if (editingGlyphRef.current) commitGlyphEdit();
+    if (editingSubRef.current) commitSubRename();
+    if (addingRef.current) commitNewItem(false);
+    if (addingSubRef.current) commitNewSub();
+    if (clickTimer.current) { clearTimeout(clickTimer.current); clickTimer.current = null; }
+    setOpenItem(null);
+    setPendingDelete(null);
+    setPendingDeleteSub(null);
+    setArranging(true);
+    flash("drag ≡ to move · drop on a header to file it there");
+  };
+  const stopArrange = () => { dragFns.current.cancel(); setArranging(false); };
+
+  // Drag engine. The handle has touch-action:none plus native non-passive
+  // touch listeners (attachHandle), takes pointer capture, and from then on
+  // only the DOM is touched per move: ghost transform, target outline, scroll.
+  // React state changes only at drag start (dim the row) and end.
+  const attachHandle = useCallback((el) => {
+    if (!el) return undefined;
+    el.addEventListener("touchstart", preventTouch, { passive: false });
+    el.addEventListener("touchmove", preventTouch, { passive: false });
+    return () => {
+      el.removeEventListener("touchstart", preventTouch);
+      el.removeEventListener("touchmove", preventTouch);
+    };
+  }, []);
+
+  if (!dragListeners.current) {
+    const call = (name) => (e) => dragFns.current[name] && dragFns.current[name](e);
+    dragListeners.current = {
+      move: call("move"), up: call("up"), cancel: call("cancel"), lost: call("lost"),
+      scroll: call("scroll"), vis: call("vis"), block: (e) => e.preventDefault(),
+    };
+  }
+
+  const markTarget = (d, el, how) => {
+    if (d.markEl && (d.markEl !== el || d.markHow !== how)) { d.markEl.style.boxShadow = ""; d.markEl.style.outline = ""; d.markEl.style.outlineOffset = ""; }
+    d.markEl = el; d.markHow = how;
+    if (!el) return;
+    if (how === "before" || how === "after") el.style.boxShadow = `inset 0 ${how === "after" ? -2 : 2}px 0 ${C.blue}`;
+    else { el.style.outline = `2px solid ${C.blue}`; el.style.outlineOffset = "-2px"; }
+  };
+
+  // What is under the finger? Probe the column's centre line so overlays (ghost,
+  // toast, ⇄, the done pill) and the side the finger is on don't matter; inert
+  // collapsed content is never hit. Over a gap, the last target is kept.
+  const hitTest = (d) => {
+    const col = document.querySelector("[data-arrange-col]");
+    if (!col) return;
+    const r = col.getBoundingClientRect();
+    let node = null;
+    for (const el of document.elementsFromPoint(r.left + r.width / 2, d.y)) {
+      const n = el.closest && el.closest("[data-drop]");
+      if (n) { node = n; break; }
+    }
+    if (!node) return;
+    const kind = node.getAttribute("data-drop");
+    const toSec = node.getAttribute("data-sec");
+    const toSub = node.getAttribute("data-sub") || "";
+    if (kind === "item") {
+      const id = node.getAttribute("data-id");
+      if (id === d.id) { d.target = null; markTarget(d, null); return; } // over itself: dropping does nothing
+      const b = node.getBoundingClientRect();
+      const side = d.y > b.top + b.height / 2 ? "after" : "before";
+      d.target = { toSec, toSub, anchor: { id, side } };
+      markTarget(d, node, side);
+    } else {
+      d.target = { toSec, toSub: kind === "sec" ? "" : toSub, anchor: kind === "end" ? "end" : "top" };
+      markTarget(d, node, "box");
+    }
+  };
+
+  const frame = (t) => {
+    const d = drag.current;
+    if (!d) return;
+    const dt = d.lastT ? Math.min(50, t - d.lastT) : 16;
+    d.lastT = t;
+    const g = ghostRef.current;
+    if (g) g.style.transform = d.touch ? `translate(${d.x - g.offsetWidth / 2}px, ${d.y - 64}px)` : `translate(${d.x + 14}px, ${d.y + 12}px)`;
+    // Autoscroll near the edges, inside the safe areas; speed scales with depth.
+    const vh = window.visualViewport ? window.visualViewport.height : window.innerHeight;
+    const top = d.safeTop + AUTOSCROLL_ZONE, bottom = vh - d.safeBottom - AUTOSCROLL_ZONE;
+    const depth = d.y < top ? -(top - d.y) / AUTOSCROLL_ZONE : d.y > bottom ? (d.y - bottom) / AUTOSCROLL_ZONE : 0;
+    if (depth) {
+      const k = Math.max(-1, Math.min(1, depth));
+      const before = window.scrollY;
+      window.scrollBy(0, Math.sign(k) * (0.15 + 1.1 * k * k) * dt);
+      if (window.scrollY !== before) hitTest(d);
+    }
+    d.raf = requestAnimationFrame(frame);
+  };
+
+  const endDrag = () => {
+    const d = drag.current;
+    if (!d) return null;
+    drag.current = null;
+    const L = dragListeners.current;
+    d.el.removeEventListener("pointermove", L.move);
+    d.el.removeEventListener("pointerup", L.up);
+    d.el.removeEventListener("pointercancel", L.cancel);
+    d.el.removeEventListener("lostpointercapture", L.lost);
+    window.removeEventListener("scroll", L.scroll);
+    window.removeEventListener("blur", L.cancel);
+    document.removeEventListener("visibilitychange", L.vis);
+    document.removeEventListener("selectstart", L.block);
+    document.removeEventListener("dragstart", L.block);
+    try { if (d.el.hasPointerCapture && d.el.hasPointerCapture(d.pointerId)) d.el.releasePointerCapture(d.pointerId); } catch (e) { /* already released */ }
+    if (d.raf) cancelAnimationFrame(d.raf);
+    markTarget(d, null);
+    if (ghostRef.current) ghostRef.current.style.display = "none";
+    if (d.moved) setDragId(null);
+    return d;
+  };
+
+  const beginDrag = (e, secKey, it) => {
+    if (!arranging || drag.current) return;
+    if (e.pointerType === "mouse" && e.button !== 0) return;
+    e.preventDefault(); // no text selection / focus change from the mouse
+    const el = e.currentTarget;
+    try { el.setPointerCapture(e.pointerId); } catch (err) { /* capture is best effort; listeners still follow the pointer on touch */ }
+    let safeTop = 0, safeBottom = 0;
+    if (safeProbeRef.current) {
+      const cs = getComputedStyle(safeProbeRef.current);
+      safeTop = parseFloat(cs.paddingTop) || 0;
+      safeBottom = parseFloat(cs.paddingBottom) || 0;
+    }
+    drag.current = { id: it.id, sec: secKey, text: it.text, el, pointerId: e.pointerId, touch: e.pointerType !== "mouse",
+      x0: e.clientX, y0: e.clientY, x: e.clientX, y: e.clientY, moved: false, target: null, markEl: null, markHow: "", raf: 0, lastT: 0, safeTop, safeBottom };
+    const L = dragListeners.current;
+    el.addEventListener("pointermove", L.move);
+    el.addEventListener("pointerup", L.up);
+    el.addEventListener("pointercancel", L.cancel);
+    el.addEventListener("lostpointercapture", L.lost);
+    window.addEventListener("scroll", L.scroll, { passive: true });
+    window.addEventListener("blur", L.cancel);
+    document.addEventListener("visibilitychange", L.vis);
+    document.addEventListener("selectstart", L.block);
+    document.addEventListener("dragstart", L.block);
+  };
+
+  // Reassigned every render so they always see current state and helpers.
+  dragFns.current = {
+    move: (e) => {
+      const d = drag.current;
+      if (!d || e.pointerId !== d.pointerId) return;
+      d.x = e.clientX; d.y = e.clientY;
+      if (!d.moved) {
+        if (Math.hypot(d.x - d.x0, d.y - d.y0) < 6) return; // a tap on the handle does nothing
+        d.moved = true;
+        const sel = window.getSelection && window.getSelection();
+        if (sel && sel.removeAllRanges) sel.removeAllRanges();
+        const g = ghostRef.current;
+        if (g) { g.textContent = d.text; g.style.display = "block"; }
+        setDragId(d.id);
+        d.raf = requestAnimationFrame(frame);
+      }
+      hitTest(d);
+    },
+    up: (e) => {
+      const d = drag.current;
+      if (!d || e.pointerId !== d.pointerId) return;
+      const target = d.moved ? d.target : null;
+      endDrag();
+      if (target) dropItem(d, target);
+    },
+    cancel: () => { endDrag(); },
+    lost: () => { endDrag(); }, // capture lost before pointerup: abort, never guess a drop
+    scroll: () => { const d = drag.current; if (d && d.moved) hitTest(d); },
+    vis: () => { if (document.visibilityState === "hidden") endDrag(); },
+  };
+
+  const dropItem = (d, target) => {
+    const st = cur();
+    const next = placeItem(st, { id: d.id, fromSec: d.sec, toSec: target.toSec, toSub: target.toSub, anchor: target.anchor });
+    if (next === st) return; // same visible order (or stale target): nothing to save or sync
+    const items = { ...next.items, [target.toSec]: next.items[target.toSec].map((it) => (it.id === d.id ? { ...it, fresh: true } : it)) };
+    persist({ ...next, items });
+    unflash(target.toSec, 1500);
+    const fromSec = st.sections.find((s) => s.key === d.sec);
+    const orig = (st.items[d.sec] || []).find((it) => it.id === d.id);
+    const sameList = d.sec === target.toSec && orig && groupOf(orig, new Set(fromSec.subs.map((x) => x.key))) === target.toSub;
+    const toEntry = next.sections.find((s) => s.key === target.toSec);
+    const subName = target.toSub && ((toEntry.subs.find((x) => x.key === target.toSub)) || {}).name;
+    offerUndo(st, sameList ? "Reordered" : `Moved to ${labelFor(target.toSec)}${subName ? " › " + subName : ""}`, undefined, [d.id]);
+  };
+
+  // Esc: abort an active drag, else leave Arrange mode (not while typing in a field).
+  useEffect(() => {
+    if (!arranging) return undefined;
+    const onKey = (e) => {
+      if (e.key !== "Escape") return;
+      const t = e.target;
+      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
+      if (drag.current) endDrag(); else setArranging(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [arranging]);
+
   // ---------- PASTE DUMP box (mirrored to the local-only draft key) ----------
   const changeDump = (v) => {
     dumpRef.current = v;
@@ -694,6 +912,21 @@ export default function ActFromHere() {
   const inputStyle = { background: C.bg, color: C.text, border: `1px solid ${C.cardEdge}` };
 
   const renderQuickAdd = (secKey, subKey, displayLabel) => {
+    // Arrange mode: same footprint as the "＋ add item" row, but it is the
+    // "end of this list" drop target (so toggling the mode moves nothing).
+    if (arranging) {
+      return (
+        <div
+          data-drop="end"
+          data-sec={secKey}
+          data-sub={subKey || ""}
+          className="w-full text-center font-mono text-xs py-2"
+          style={{ color: C.faint, borderTop: `1px solid ${C.cardEdge}` }}
+        >
+          ↓ drop here
+        </div>
+      );
+    }
     const isOpen = addingItem && addingItem.sec === secKey && (addingItem.sub || null) === (subKey || null);
     return isOpen ? (
       <div
@@ -744,18 +977,36 @@ export default function ActFromHere() {
     const isEditing = editing && editing.id === it.id && editing.sec === sec.key;
     const href = safeHref(it.url);
     const subKeys = new Set(sec.subs.map((x) => x.key));
-    const position = `${sec.key}/${it.sub && subKeys.has(it.sub) ? it.sub : ""}`;
+    const group = groupOf(it, subKeys);
+    const position = `${sec.key}/${group}`;
     return (
       <div
         key={it.id}
+        data-drop="item"
+        data-sec={sec.key}
+        data-sub={group}
+        data-id={it.id}
         className="transition-colors duration-700"
         style={{
           borderTop: idx === 0 ? "none" : `1px solid ${C.cardEdge}`,
           background: it.fresh ? C.blueSoft : "transparent",
+          opacity: dragId === it.id ? 0.35 : 1,
         }}
       >
         <div className="flex items-start gap-3 px-3 py-2.5">
-          {sec.key !== "note" ? (
+          {arranging ? (
+            // the drag handle takes the checkbox's slot and hit area, so nothing reflows
+            <span
+              ref={attachHandle}
+              data-handle={it.id}
+              aria-label={`drag ${it.text}`}
+              onPointerDown={(e) => beginDrag(e, sec.key, it)}
+              className="-m-2.5 p-2.5 flex-shrink-0 cursor-grab select-none [touch-action:none] [-webkit-touch-callout:none]"
+              style={{ color: C.blue }}
+            >
+              <span className="mt-0.5 w-5 h-5 flex items-center justify-center text-base leading-none">≡</span>
+            </span>
+          ) : sec.key !== "note" ? (
             // 40×40 hit area around the 20×20 circle; the equal negative margin keeps the layout unchanged
             <button
               onClick={() => toggle(sec.key, it.id)}
@@ -816,23 +1067,32 @@ export default function ActFromHere() {
               </div>
             ) : (
               <>
-                <button
-                  onPointerDown={(e) => { lastPointer.current = e.pointerType; }}
-                  onClick={() => handleItemClick(it.id)}
-                  onDoubleClick={() => handleItemDblClick(sec.key, it)}
-                  className="text-left w-full text-sm leading-snug focus:outline-none"
-                  style={{
-                    color: it.done ? C.faint : C.text,
-                    textDecoration: it.done ? "line-through" : "none",
-                  }}
-                >
-                  {it.text}
-                </button>
+                {arranging ? (
+                  <span
+                    className="inline-block text-left w-full text-sm leading-snug"
+                    style={{ color: it.done ? C.faint : C.text, textDecoration: it.done ? "line-through" : "none" }}
+                  >
+                    {it.text}
+                  </span>
+                ) : (
+                  <button
+                    onPointerDown={(e) => { lastPointer.current = e.pointerType; }}
+                    onClick={() => handleItemClick(it.id)}
+                    onDoubleClick={() => handleItemDblClick(sec.key, it)}
+                    className="text-left w-full text-sm leading-snug focus:outline-none"
+                    style={{
+                      color: it.done ? C.faint : C.text,
+                      textDecoration: it.done ? "line-through" : "none",
+                    }}
+                  >
+                    {it.text}
+                  </button>
+                )}
                 {it.next && (
                   <div className="text-xs mt-0.5" style={{ color: C.dim }}>→ {it.next}</div>
                 )}
                 {it.url && (href ? (
-                  <a href={href} target="_blank" rel="noreferrer" className="inline-block mt-0.5 text-xs font-mono" style={{ color: C.blue }}>
+                  <a href={href} target="_blank" rel="noreferrer" draggable={false} className={`inline-block mt-0.5 text-xs font-mono ${arranging ? "pointer-events-none" : ""}`} style={{ color: C.blue }}>
                     link ↗
                   </a>
                 ) : (
@@ -882,7 +1142,7 @@ export default function ActFromHere() {
 
   return (
     <div className="min-h-screen min-h-[100dvh] pb-24" style={{ background: C.bg, color: C.text, fontFamily: "-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Roboto, sans-serif" }}>
-      <div className="max-w-xl mx-auto px-4 pt-6">
+      <div className="max-w-xl mx-auto px-4 pt-6" data-arrange-col="">
 
         {/* header */}
         <div className="flex items-end justify-between mb-1">
@@ -937,8 +1197,20 @@ export default function ActFromHere() {
           </div>
         </div>
 
-        {/* clear done */}
-        <div className="flex justify-end mb-4">
+        {/* arrange toggle (left) + clear done (right) */}
+        <div className="flex justify-between items-center mb-4">
+          <button
+            onClick={() => (arranging ? stopArrange() : startArrange())}
+            aria-pressed={arranging}
+            className="font-mono text-xs px-3 py-1.5 rounded-full focus:outline-none focus-visible:ring-2 [touch-action:manipulation]"
+            style={{
+              border: `1px solid ${arranging ? C.blue : C.cardEdge}`,
+              color: arranging ? "#fff" : C.dim,
+              background: arranging ? C.blue : "transparent",
+            }}
+          >
+            {arranging ? "✓ done arranging" : "↕ arrange"}
+          </button>
           <button
             onClick={clearDone}
             disabled={!doneCount}
@@ -953,17 +1225,18 @@ export default function ActFromHere() {
           </button>
         </div>
 
-        {/* sections */}
+        {/* sections (no text selection or callouts while arranging; a drag starts only on ≡) */}
+        <div className={arranging ? "select-none [-webkit-touch-callout:none]" : undefined}>
         {data.sections.map((sec) => {
           const items = data.items[sec.key] || [];
           const open = items.filter((i) => !i.done).length;
           const isCollapsed = !!data.collapsed[sec.key];
           const displayLabel = labelFor(sec.key);
           const subKeys = new Set(sec.subs.map((x) => x.key));
-          const ungrouped = items.filter((i) => !i.sub || !subKeys.has(i.sub));
+          const ungrouped = items.filter((i) => groupOf(i, subKeys) === "");
           return (
             <div key={sec.key} className="mb-6 group">
-              <div className="flex items-baseline justify-between mb-2 px-1 gap-2">
+              <div className="flex items-baseline justify-between mb-2 px-1 gap-2" data-drop="sec" data-sec={sec.key}>
                 <h2 className="text-sm font-extrabold tracking-widest flex items-baseline gap-1.5 min-w-0" style={{ color: C.text }}>
                   <button
                     onClick={() => toggleCollapse(sec.key)}
@@ -989,14 +1262,14 @@ export default function ActFromHere() {
                       style={{ background: "transparent", color: C.text, borderBottom: `1px solid ${C.blue}`, width: "14rem" }}
                     />
                   ) : (
-                    <span className="truncate" onDoubleClick={() => startCatEdit(sec.key, displayLabel)}>{displayLabel}</span>
+                    <span className="truncate" onDoubleClick={() => { if (!arranging) startCatEdit(sec.key, displayLabel); }}>{displayLabel}</span>
                   )}
                 </h2>
                 <span className="flex items-baseline gap-2 flex-shrink-0">
                   <button
                     onClick={() => { if (addingSub === sec.key) closeNewSub(); else { openNewSub(sec.key); if (isCollapsed) toggleCollapse(sec.key); } }}
                     aria-label={`add subsection to ${displayLabel}`}
-                    className={`font-mono text-xs px-2 py-1 rounded-md focus:outline-none focus-visible:ring-2 [touch-action:manipulation] ${TOUCH_CHIP} ${REVEAL_SEC}`}
+                    className={`font-mono text-xs px-2 py-1 rounded-md focus:outline-none focus-visible:ring-2 [touch-action:manipulation] ${TOUCH_CHIP} ${REVEAL_SEC} ${arranging ? "invisible" : ""}`}
                     style={{ color: C.blue, border: `1px solid ${C.cardEdge}`, background: "transparent" }}
                   >
                     ＋ subsection
@@ -1009,7 +1282,7 @@ export default function ActFromHere() {
               <Collapsible open={!isCollapsed}>
                 <div className="rounded-2xl overflow-hidden" style={{ background: C.card, border: `1px solid ${C.cardEdge}` }}>
                   {items.length === 0 && sec.subs.length === 0 && (
-                    <div className="px-4 py-4 text-sm" style={{ color: C.faint }}>
+                    <div className="px-4 py-4 text-sm" style={{ color: C.faint }} data-drop="end" data-sec={sec.key} data-sub="">
                       empty — {metaHint(sec.key)}
                     </div>
                   )}
@@ -1027,6 +1300,9 @@ export default function ActFromHere() {
                         <div
                           role="button"
                           tabIndex={0}
+                          data-drop="sub"
+                          data-sec={sec.key}
+                          data-sub={sub.key}
                           aria-expanded={!sub.collapsed}
                           aria-label={`${sub.collapsed ? "expand" : "collapse"} ${sub.name}`}
                           className="group/sub flex items-center gap-2 px-3 py-2 min-h-[36px] cursor-pointer select-none [touch-action:manipulation] focus:outline-none focus-visible:ring-2"
@@ -1064,7 +1340,7 @@ export default function ActFromHere() {
                             {sec.key === "note" ? `${subItems.length}` : `${subOpen} open`}
                           </span>
                           {!isRenaming && (
-                            <span className={`flex items-center gap-1 flex-shrink-0 ${REVEAL_SUB}`}>
+                            <span className={`flex items-center gap-1 flex-shrink-0 ${REVEAL_SUB} ${arranging ? "invisible" : ""}`}>
                               <button data-act="rename" aria-label={`rename ${sub.name}`} className={`text-xs px-1.5 py-1 rounded-md focus:outline-none focus-visible:ring-2 ${TOUCH_ICON}`} style={{ color: C.dim, background: "transparent" }}>✎</button>
                               <button data-act="delete" aria-label={`delete ${sub.name}`} className={`text-xs px-1.5 py-1 rounded-md focus:outline-none focus-visible:ring-2 ${TOUCH_ICON}`} style={{ color: C.red, background: "transparent" }}>🗑</button>
                             </span>
@@ -1079,7 +1355,7 @@ export default function ActFromHere() {
                         )}
                         <Collapsible open={!sub.collapsed}>
                           {subItems.length === 0 && (
-                            <div className="px-4 py-3 text-xs" style={{ color: C.faint, borderTop: `1px solid ${C.cardEdge}` }}>empty — add one below</div>
+                            <div className="px-4 py-3 text-xs" style={{ color: C.faint, borderTop: `1px solid ${C.cardEdge}` }} data-drop="end" data-sec={sec.key} data-sub={sub.key}>{arranging ? "empty — drop here" : "empty — add one below"}</div>
                           )}
                           {subItems.map((it, idx) => renderItem(sec, it, idx === 0 ? 1 : idx))}
                           {renderQuickAdd(sec.key, sub.key, `${displayLabel} › ${sub.name}`)}
@@ -1112,8 +1388,10 @@ export default function ActFromHere() {
             </div>
           );
         })}
+        </div>
 
-        {/* section manager */}
+        {/* section manager (hidden while arranging: its new-section form has no ref mirror) */}
+        {!arranging && (
         <div className="mt-2">
           <div className="flex justify-center">
             <button
@@ -1273,13 +1551,38 @@ export default function ActFromHere() {
             </div>
           )}
         </div>
+        )}
 
         <div className="text-center font-mono text-xs mt-8" style={{ color: C.faint }}>
           === BRICK BY BRICK === · no recallin means u ain't ballin
         </div>
       </div>
 
-      {/* toast */}
+      {/* Arrange mode: exit pill (bottom-left; ⇄ is bottom-right), drag ghost, safe-area probe.
+          Rendered here at the root: inside a Collapsible, contain:layout would trap position:fixed. */}
+      {arranging && (
+        <>
+          <button
+            onClick={stopArrange}
+            className="fixed z-40 font-mono text-xs font-bold px-3 py-1.5 rounded-full shadow-lg focus:outline-none focus-visible:ring-2 [touch-action:manipulation]"
+            style={{ left: 14, bottom: "max(14px, env(safe-area-inset-bottom))", background: C.blue, color: "#fff", border: `1px solid ${C.blue}` }}
+          >
+            ✓ done
+          </button>
+          <div
+            ref={ghostRef}
+            aria-hidden="true"
+            className="fixed left-0 top-0 z-[60] px-3 py-2 rounded-xl text-sm pointer-events-none truncate"
+            style={{ display: "none", maxWidth: "min(280px, 80vw)", background: C.card, color: C.text, border: `1px solid ${C.blue}`, boxShadow: "0 12px 32px rgba(0,0,0,0.65)", transform: "translate(-9999px,0)" }}
+          />
+          <span
+            ref={safeProbeRef}
+            aria-hidden="true"
+            style={{ position: "fixed", top: 0, left: 0, width: 0, height: 0, visibility: "hidden", pointerEvents: "none", paddingTop: "env(safe-area-inset-top)", paddingBottom: "env(safe-area-inset-bottom)" }}
+          />
+        </>
+      )}
+
       {/* toast — sits above the ⇄ sync button (fixed bottom-right, ~30 px tall) so they never overlap */}
       {toast && (
         <div

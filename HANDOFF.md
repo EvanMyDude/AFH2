@@ -9,8 +9,8 @@ Read this first in a fresh session. It says what exists, how it fits together, w
 | Live | https://evanmydude.github.io/AFH2/ (GitHub Pages, deploy-from-branch, `main`, folder `/`) |
 | Repo | https://github.com/EvanMyDude/AFH2 — local checkout `~/Desktop/AFH2`, branch `main` |
 | Predecessor | https://github.com/EvanMyDude/ActFromHere → https://evanmydude.github.io/ActFromHere/ (untouched, still live) |
-| Shipped | PR #1 (feature + review fixes, with walkthrough GIF), PR #2 (legacy-import self-heal). Both merged. 2026-10-03 batch (branch `claude/gracious-dirac-0b68c3`, one PR): paste-dump draft survives relaunch, instant item menu on touch + ~40 px touch targets, undo for delete / clear done / move / Sort It (§2). |
-| Tests | `npm test` → 26 passing (`node:test`, no browser) |
+| Shipped | PR #1 (feature + review fixes, with walkthrough GIF), PR #2 (legacy-import self-heal). Both merged. 2026-10-03 batch (branch `claude/gracious-dirac-0b68c3`, one PR): paste-dump draft survives relaunch, instant item menu on touch + ~40 px touch targets, undo for delete / clear done / move / Sort It, Arrange mode (drag to reorder and file items) (§2). The build live before it is preserved on branch `backup/live-before-2026-10-03` (§7). |
+| Tests | `npm test` → 35 passing (`node:test`, no browser) |
 | Build | `app.js` and `styles.css` are **committed build outputs**; the live bundle hash was verified equal to the local build |
 | Verified | Migration from the old app's data, all subsection flows, reordering, corrupt-data guard, Esc/collapse form semantics — in headless Chromium against fixtures. Live site loads clean with CSP. |
 | Data | **Migrated and live.** Per the owner (2026-10-03), the real items live in AFH2 on desktop and iPhone and sync through the private `afh2-data` gist. See §8. Every change must load over that data as a no-op (§6, `CLAUDE.md`). |
@@ -29,6 +29,7 @@ Act From Here 2 is the original single-page React PWA (paste-dump sorter + secti
 - PASTE DUMP text is mirrored to the local-only `afh2-dump-draft`, so it survives iOS killing the app and adoption reloads; a sort clears only what it sorted.
 - On touch the item menu opens on tap (the 220 ms double-click wait is mouse-only); checkbox, section glyph, menu controls, subsection ✎/🗑 and "＋ subsection" have ~40 px touch areas; desktop renders identically. `Collapsible` gained `min-w-0`, fixing cards that a long subsection name widened past the phone screen.
 - Undo (6 s toast) for item delete, clear done, move and Sort It.
+- **Arrange mode** ("↕ arrange", left of "clear done"): a ≡ handle replaces each checkbox; drag to reorder within a list, between a section's main list and its subsections (both ways), onto a collapsed subsection, or onto another section's header (top of its main list; easiest with sections collapsed). The page autoscrolls near the edges. Every drop is undoable. Not persisted; off on every load.
 
 Depth: `docs/plans/2026-09-14-feat-afh2-subsections-big-ticket-plan.md` (design + every decision and its reason), `todos/` (ten review findings, all resolved, each with the reasoning), PR #1 description.
 
@@ -47,11 +48,13 @@ AFH2/
   src/
     model.js              PURE STATE MODEL, no React. The only place that knows the persisted shape.
     seed-big-ticket.js    Big Ticket manifest (BIG_TICKET) + applySeed(state) (idempotent)
+    arrange.js            Arrange mode's pure state change: groupOf(it, subKeys), placeItem(state, {...})
     act-from-here.jsx     the UI component (≈1200 lines)
     pages-main.jsx        storage adapter, gist sync, import/export, first boot, SyncPanel, boot()
   test/
     model.test.js         migrate/serialize/seed/catchAllKey/safeHref/clampSavedAt/looksLikeState
     seed.test.js          manifest sanity + applySeed idempotency / deletions / missing section / round-trip
+    arrange.test.js       placeItem: reorder, main list ↔ subsection, cross-section, top/end anchors, no-op + stale requests, round-trip
   docs/plans/             the design plan (living document; checkboxes reflect verified ACs)
   docs/screenshots/       full-page + viewport shots, walkthrough frames, afh2-walkthrough.gif
   todos/                  review findings 001–010, all `complete`
@@ -80,6 +83,9 @@ AFH2/
 - **`afh:flush` listener** (registered once, calls `onFlushRef`): commits every open form, cancels the debounce, and writes directly through `storage.set` if the serialized state differs from what is stored. The sync layer dispatches this event synchronously before reading meta on hide/pagehide and before any adoption.
 - **`<Collapsible open>`**: `grid` + `grid-template-rows 0fr↔1fr` transition, inner `min-h-0 min-w-0 overflow-clip [contain:layout]` with `inert={!open}`. Used for sections and subsections. `min-w-0` matters: without it the content's min-content width (a long subsection name, before truncation) widened the card past the column on a phone (a 66-character name made the page 716 px wide at 390 px).
 - **Item tap vs double-click:** `onPointerDown` on the item text records `pointerType`. Only a mouse keeps the `CLICK_DELAY` (220 ms) wait that separates single click (menu) from double click (edit). Touch, pen and keyboard open the menu immediately; a second click on the same item within `CLICK_DELAY` of opening is ignored (`menuOpened`), so a double-tap never blinks the menu closed and the `dblclick` that follows still edits. Chromium turns two touch taps up to ~500 ms apart into a `dblclick` (old and new builds alike); what iOS does is a device check.
+- **Arrange mode** (`arranging`, local UI state). `startArrange` lands open forms (the same guarded commits as `afh:flush`) and closes menus; the ⚙ manager isn't rendered while arranging (its new-section form has no ref mirror). The mode is layout-stable: the ≡ handle takes the checkbox slot (same 40 px hit area), item text becomes an `inline-block` span (the button's display, so rows keep their exact height), "＋ add item" rows become same-height `data-drop="end"` strips, and "＋ subsection" / ✎ / 🗑 become `invisible`. Drop targets are tagged in the DOM: `data-drop="item"` rows (top half = before, bottom half = after), `"sub"` headers (top of that subsection), `"sec"` header rows (top of the main list), `"end"` strips and empty placeholders. Section and subsection collapsing still works and is still a synced edit.
+- **Drag engine:** the handle has `touch-action:none` plus native non-passive `touchstart`/`touchmove` `preventDefault` (`attachHandle`, a stable `useCallback` ref; React's own touch listeners are passive, so they can't stop iOS scrolling). `beginDrag` takes pointer capture and adds element/window listeners through stable wrappers (`dragListeners`) that call the current render's `dragFns`. Per move, nothing re-renders: `hitTest` probes `document.elementsFromPoint` on the column's centre line (`[data-arrange-col]`), so the ghost, toast, pill and ⇄ never block it, and inert collapsed content is never hit. Target marks are inline styles on the target element (an inset box-shadow line, or an outline). The ghost (`ghostRef`, rendered at the root, because `contain:layout` inside a Collapsible would trap `position:fixed`) moves by transform. React state changes only at drag start (`dragId` dims the row) and end. Autoscroll runs in an rAF loop, time-based, in a 72 px zone inset by `env(safe-area-inset-*)` (read from `safeProbeRef`). A move under 6 px is a tap and does nothing. `pointercancel`, `lostpointercapture`, Esc, window `blur` and `visibilitychange`→hidden abort without writing. `dropItem` → `placeItem`; the same object back means nothing is persisted; otherwise `persist` + flash + `offerUndo(…, ids)` ("Reordered" / "Moved to …").
+- **`placeItem`** (`src/arrange.js`): anchors are `{id, side}` or `"top"`/`"end"`, relative to the target list's own members (top = before its first member). That keeps array order sensible for a later subsection delete. An empty list keeps the old index in the same section, or index 0 elsewhere (like `move()`). It returns the same object when the visible order, section and subsection are unchanged, or for any stale request (missing item, section, subsection or anchor, anchor in another list or the item itself, id already in the target section). It never mutates. The render's main-list filter uses the same `groupOf`.
 - **Undo:** `remove` (item delete), `move`, `clearDone` and Sort It (success and fallback) call `offerUndo(before, msg, dump?)` right after their `persist`. It keeps `{ before, after: serialize(cur()), dump }` and shows the toast with an "undo" button for 6 s. `undo()` restores `before` only while `serialize(cur()) === after` (cosmetic `fresh` changes don't count); `persist` retires a pending undo on any other edit, and a plain `flash` replaces it. Restoring is a normal edit (stamped and pushed); restored items flash; Sort It undo puts the sorted text back in PASTE DUMP. The toast is a `role="status"` region 40 px above the ⇄ button (z-40), so they never overlap.
 - **Touch targets:** checkbox and section-glyph buttons grow their hit area with padding plus an equal negative margin (layout and pixels unchanged); `TOUCH_TALL` / `TOUCH_ICON` apply only under `(pointer:coarse)` (menu select/edit/delete, subsection ✎/🗑 → 40 px); `TOUCH_CHIP` extends "＋ subsection" with an invisible `::after`. Don't put `rounded-full` on an enlarged hit-area button: Chromium hit-tests the rounded shape. The desktop page renders byte-identical to the pre-change build.
 - **Rendering per section:** ungrouped items (no `sub`, or a dangling `sub`) render first, exactly like the original app, then each subsection group in `subs` order. `renderItem` and `renderQuickAdd` are shared by both.
@@ -149,7 +155,13 @@ Merge to `main` → GitHub Pages builds automatically (legacy build, `.nojekyll`
 gh api repos/EvanMyDude/AFH2/pages/builds/latest --jq '{status, error: .error.message}'
 shasum -a 256 app.js; curl -s "https://evanmydude.github.io/AFH2/app.js?x=$(date +%s)" | shasum -a 256   # must match
 ```
-Nothing else to configure. Rollback = revert on `main`.
+Nothing else to configure.
+
+**Rollback.** The build that was live before the 2026-10-03 batch (main at 7732427) is preserved as branch `backup/live-before-2026-10-03`. A tag push was refused by the session's git proxy, so there is no tag on the remote. Two ways back:
+1. Instant: repo Settings → Pages → Source branch `backup/live-before-2026-10-03`, folder `/`. Same URL; switch back to `main` later.
+2. Normal: revert the merge commit on `main` via a PR.
+
+Either way is data-safe: nothing since 7732427 changes the persisted shape (item order and `sub` are existing fields; the old build ignores the local-only `afh2-dump-draft`). Devices run the restored bundle after two opens (service worker).
 
 ## 8. Migration of the user's real data: done
 

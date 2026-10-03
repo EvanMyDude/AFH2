@@ -24,8 +24,8 @@ loads on a device after a merge.
   `api.anthropic.com`. A build under test that pushed fixture data to the real gist with a newer timestamp would be
   adopted by every device.
 - GitHub Pages serves `main` directly, and `app.js` and `styles.css` are committed build outputs. Work on a branch,
-  open a PR, never push to `main`; the owner merges. Rebuild with `npm run build` and commit the outputs with the
-  source.
+  open a PR, never push to `main`; merge a PR only when the owner explicitly asks. Rebuild with `npm run build` and
+  commit the outputs with the source.
 - Never publish a preview anywhere under `evanmydude.github.io`: every page on that origin shares the live app's
   localStorage and token.
 - The repo is public. Keep any data export (`afh2-backup-*.json`) outside the working tree, and keep its contents out
