@@ -1,6 +1,6 @@
 # AFH2 — Handoff
 
-Read this first in a fresh session. It says what exists, how it fits together, what must not be broken, and what is still open. Written 2026-09-19 after the initial build (2026-09-14).
+Read this first in a fresh session. It says what exists, how it fits together, what must not be broken, and what is still open. Written 2026-09-19 after the initial build (2026-09-14); status refreshed 2026-10-03. `CLAUDE.md` holds the rules for touching the live data.
 
 ## 1. Status at a glance
 
@@ -13,8 +13,8 @@ Read this first in a fresh session. It says what exists, how it fits together, w
 | Tests | `npm test` → 26 passing (`node:test`, no browser) |
 | Build | `app.js` and `styles.css` are **committed build outputs**; the live bundle hash was verified equal to the local build |
 | Verified | Migration from the old app's data, all subsection flows, reordering, corrupt-data guard, Esc/collapse form semantics — in headless Chromium against fixtures. Live site loads clean with CSP. |
-| **Open** | **The user's real data has not been migrated yet.** Desktop Chrome had no copy of the old app's data and sync was off, so AFH2 seeded defaults there. Data lives on the iPhone and possibly the old app's gist. See §8. |
-| Not verified | Two-device gist adoption (needs a token); iPhone hover/touch behavior on a real device. |
+| Data | **Migrated and live.** Per the owner (2026-10-03), the real items live in AFH2 on desktop and iPhone and sync through the private `afh2-data` gist. See §8. Every change must load over that data as a no-op (§6, `CLAUDE.md`). |
+| Not verified by an assistant | Two-device gist adoption against the real gist (needs the owner's token; exercised only against a stubbed gist); iPhone hover/touch behavior on a real device. |
 
 ## 2. What was built
 
@@ -50,7 +50,8 @@ AFH2/
   docs/plans/             the design plan (living document; checkboxes reflect verified ACs)
   docs/screenshots/       full-page + viewport shots, walkthrough frames, afh2-walkthrough.gif
   todos/                  review findings 001–010, all `complete`
-  README.md               user-facing: features, migration runbook, sync/keys, rebuild
+  README.md               user-facing: features, migration runbook (historical), sync/keys, rebuild
+  CLAUDE.md               rules for changes that load over the live data (points here)
 ```
 
 ### `src/model.js` — exports and roles
@@ -127,6 +128,7 @@ npm run serve          # python http.server on http://127.0.0.1:8787
 - **Legacy-import fixture trick (browser):** on the loaded page run `window.storage.frozen = true` (so the page-hide flush can't recreate `afh2-v1` on navigation), remove the `afh2-*` keys, set `afh-v1` to a v3 payload and `afh-meta` to `{savedAt, pushedAt}`, reload. Check `afh2-v1`, `afh2-meta`, and that `afh-v1` is byte-identical.
 - Playwright MCP works well for this (attribute selectors like `button[aria-label="add subsection to THIS MONTH"]`, `[role="button"][aria-label="collapse WEEK 1"]`, `select[aria-label="move to"]`, `button[aria-label="move THIS MONTH down"]`). Screenshots resolve relative to Playwright's own cwd. `agent-browser` (via `npx -y agent-browser`) was unreliable here: its `eval` and `screenshot` targeted different tabs and it lacks `:has-text()`.
 - ffmpeg on this machine is broken (missing Homebrew libvpx); the walkthrough GIF was made with Pillow (`python3`, `PIL` 12).
+- **No-op upgrade test (required for every change, see `CLAUDE.md`).** A scratch Playwright script outside the repo: serve the `main` build at a `/AFH2/` path with the service worker enabled, seed `afh2-v1` with a canonical fixture (`serialize(applySeed(seed()))`, plus a variant with done items, a collapsed section and subsection, a label override, a link and a next step) and `afh2-meta` `{savedAt: T, pushedAt: T}`; with and without a fake token whose stubbed gist holds the same `savedAt`. Load once, then swap the served files to the branch build and load twice (the first load is the SW-cached old bundle), idling past the 2.5 s push debounce and firing `visibilitychange`→hidden and `pagehide` each time, at 390×844 touch and 1280×900 mouse. Pass = `afh2-v1` and `afh2-meta` byte-identical, no new localStorage keys, no POST/PATCH to `api.github.com`, no `api.anthropic.com` call, no page errors, and a check that the new bundle actually ran. Route `https://api.github.com/**` and `https://api.anthropic.com/**` in every browser test; never use a real token.
 - Git identity for this repo's commits: `EvanMyDude <evaneskimo@gmail.com>` (passed with `-c`; the global config is a different identity).
 
 ## 7. Deploy
@@ -138,19 +140,17 @@ shasum -a 256 app.js; curl -s "https://evanmydude.github.io/AFH2/app.js?x=$(date
 ```
 Nothing else to configure. Rollback = revert on `main`.
 
-## 8. Open item: migrate the user's real data (needs the user)
+## 8. Migration of the user's real data: done
 
-Where the data is: the iPhone's installed Act From Here app (iOS gives each home-screen web app isolated storage) and, if a GitHub token was ever pasted there, the old app's gist `act-from-here-data`. The desktop Chrome checked on 2026-09-14 had neither the data nor a token; AFH2 there holds the untouched default seed (meta 1/1), so it will still import automatically if the old data shows up (PR #2).
+The owner moved their real items into AFH2 after 2026-09-19 (reported 2026-10-03; an assistant did not observe the steps). They now live in each device's `afh2-v1`/`afh2-meta` and in the private `afh2-data` gist, which keeps every device in sync. The owner also holds a recent export as a last resort; it is not in this repo and must never be committed (`CLAUDE.md`).
 
-Paths (also in README):
-1. **Token on the phone:** open https://evanmydude.github.io/ActFromHere/ on desktop Chrome, paste the token in its ⇄ panel (pulls the gist) → open https://evanmydude.github.io/AFH2/ → it imports, seeds Big Ticket, pushes to `afh2-data` → on the iPhone add AFH2 to the Home Screen, ⇄ → paste token → adopts.
-2. **No token:** on the phone, old app ⇄ → export (JSON to Files) → AFH2 on the phone ⇄ → import. Big Ticket seeds on import.
-
-An assistant cannot enter the token (credential); the user does that step. After it, verify: legacy items visible, no red conflict banner, `gh gist list` shows one `afh2-data`.
+What this changes for future work: the legacy-import paths in `firstBoot` (§3) still exist but only fire on a device whose AFH2 storage is missing or holds the untouched default seed, which no longer describes the owner's devices. The README's "Migrating from the original app" runbook is historical. The risk that matters now is a new build changing existing data when it loads; see the no-op upgrade test in §6.
 
 ## 9. Known limits and deferred ideas
 
 - Sync is last-write-wins on wall-clock timestamps; a device with a clock > 24 h fast is refused by others (`clampSavedAt`).
+- **Last-write-wins can drop an edit with no backup (confirmed 2026-10-03, headless Chromium, two contexts, stubbed gist).** `pushNow` PATCHes without reading the remote first. Repro: a desktop tab stays visible (no `visibilitychange`, so no pull); the phone adds item X and pushes; the desktop then makes any edit (checking an item off; by the code, collapsing a section also counts) and pushes its older state; the phone reopens and adopts it. X is gone on both devices and from the gist head, and neither device stashes anything (the phone had already pushed). Other routes to the same result: edits on both devices between syncs (e.g. phone offline), and the return-to-visible path pushing local edits blind (`pages-main.jsx` visibilitychange handler). GitHub keeps gist revisions, so the gist history is the only remaining copy. A proposed fix (pull-before-push plus a three-way merge against a local-only base snapshot) needs the owner's OK because it changes the sync engine.
+- Open findings, not fixed (2026-10-03): the conflict backup is a single slot (`afh2-conflict-backup`), so a second conflict silently replaces an unrecovered first one; Sort It's `fetch` has no timeout; `SyncPanel`'s `msgTimer` is recreated every render so old message timers cannot be cancelled; `storage.set` returns success while `frozen`; gist reads do not set `cache: "no-store"` (whether GitHub's API responses are browser-cacheable for 60 s was not verified); `tmp/screenshots/` holds 10 committed PNGs that are only 2 distinct images; `npm audit` reports 5 high findings in Tailwind's build-time dependency chain (`braces`/`micromatch`), not in the shipped bundle.
 - Gist content > 1 MB is refused (push) / detected (pull) — export a backup and clear done items.
 - Every Pages site on this GitHub account shares the origin and can read the two stored keys (documented in README). Not fixable in-app.
 - Deferred by design (see plan D9): subsection ▲/▼ reordering, sorter routing into subsections, a subsection list inside the ⚙ manager, dblclick rename on group headers, multi-slot conflict backup.
