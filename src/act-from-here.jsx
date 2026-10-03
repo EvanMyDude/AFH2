@@ -20,6 +20,11 @@ const C = {
 };
 
 const CLICK_DELAY = 220; // ms window separating single click (expand) from double click (edit)
+// Local-only copy of the PASTE DUMP box, so text pasted from Notes survives the
+// app being killed in the background or a sync reload. Never synced, never
+// exported, never read by the sync layer; written only when the box changes.
+const DRAFT_KEY = "afh2-dump-draft";
+const readDraft = () => { try { return localStorage.getItem(DRAFT_KEY) || ""; } catch (e) { return ""; } };
 const metaLabel = (key) => (has(SECTION_META, key) ? SECTION_META[key].label : "UNTITLED");
 const metaHint = (key) => (has(SECTION_META, key) ? SECTION_META[key].hint : "nothing here yet");
 
@@ -45,7 +50,7 @@ function Collapsible({ open, children }) {
 export default function ActFromHere() {
   const [data, setData] = useState(null); // v4 state — see model.js
   const [loadError, setLoadError] = useState("");
-  const [dump, setDump] = useState("");
+  const [dump, setDump] = useState(readDraft);
   const [sorting, setSorting] = useState(false);
   const [toast, setToast] = useState("");
   const [saveState, setSaveState] = useState("");
@@ -81,6 +86,7 @@ export default function ActFromHere() {
   const busy = useRef(false);      // a write is in flight
   const dirty = useRef(false);     // state changed while writing
   const clickTimer = useRef(null); // single-vs-double click disambiguation
+  const dumpRef = useRef(dump);    // live PASTE DUMP text (a sort in flight compares against it)
 
   const cur = () => latest.current;
   const labelFor = (key) => {
@@ -504,9 +510,24 @@ export default function ActFromHere() {
     return () => window.removeEventListener("afh:flush", onFlush);
   }, []);
 
+  // ---------- PASTE DUMP box (mirrored to the local-only draft key) ----------
+  const changeDump = (v) => {
+    dumpRef.current = v;
+    setDump(v);
+    try { if (v) localStorage.setItem(DRAFT_KEY, v); else localStorage.removeItem(DRAFT_KEY); }
+    catch (e) { /* quota / storage disabled — the box still works, it just won't survive a relaunch */ }
+  };
+  // A sort consumed `sent`. Clear only that: text typed into the box while
+  // "Sorting…" ran stays put instead of being wiped with the sorted lines.
+  const consumeDump = (sent) => {
+    const now = dumpRef.current;
+    changeDump(now === sent ? "" : now.startsWith(sent) ? now.slice(sent.length).replace(/^\s+/, "") : now);
+  };
+
   // ---------- AI dump sorter — consumes the LIVE section set ----------
   const sortDump = async () => {
-    const raw = dump.trim();
+    const sent = dumpRef.current;
+    const raw = sent.trim();
     if (!raw || sorting) return;
     const stNow = cur();
     if (!stNow.sections.length) {
@@ -556,7 +577,7 @@ export default function ActFromHere() {
         n++;
       }
       persist({ ...st, items: nextItems });
-      setDump("");
+      consumeDump(sent);
       flash(`Sorted ${n} item${n === 1 ? "" : "s"} ⚡`);
       setTimeout(() => {
         setLocal((st) => ({ ...st, items: Object.fromEntries(Object.entries(st.items).map(([k, a]) => [k, a.map((x) => (x.fresh ? { ...x, fresh: false } : x))])) }));
@@ -570,7 +591,7 @@ export default function ActFromHere() {
       if (!catchAll) { setSorting(false); return; }
       const lines = raw.split("\n").map((l) => l.trim()).filter((l) => l && !/^[=^\-\s]+$/.test(l));
       persist({ ...st, items: { ...st.items, [catchAll]: [...lines.map((l) => ({ id: uid(), text: l, done: false, fresh: true })), ...st.items[catchAll]] } });
-      setDump("");
+      consumeDump(sent);
       flash(`Sort failed (${reason}) — dumped into ${labelFor(catchAll)} as-is, nothing lost`);
     } finally {
       setSorting(false);
@@ -814,7 +835,7 @@ export default function ActFromHere() {
           </div>
           <textarea
             value={dump}
-            onChange={(e) => setDump(e.target.value)}
+            onChange={(e) => changeDump(e.target.value)}
             placeholder={"‣ call about the thing\n» buy the other thing\nsome mantra that hit 🔦\n…"}
             rows={4}
             className="w-full rounded-lg p-3 text-sm font-mono resize-y outline-none"
