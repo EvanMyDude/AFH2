@@ -4,7 +4,7 @@ import {
   uid, firstGrapheme, migrate, serialize, seed, catchAllKey, safeHref, has,
 } from "./model.js";
 import { applySeed } from "./seed-big-ticket.js";
-import { placeItem, groupOf } from "./arrange.js";
+import { placeItem, groupOf, placeSub, promoteSub } from "./arrange.js";
 
 // ---------- palette (Apple Notes dark, his native habitat) ----------
 const C = {
@@ -74,6 +74,7 @@ export default function ActFromHere() {
   const [toastUndo, setToastUndo] = useState(false); // the toast carries an "undo" button
   const [arranging, setArranging] = useState(false);  // Arrange mode (local UI state, never persisted)
   const [dragId, setDragId] = useState(null);         // item being dragged (dims its row)
+  const [dragSub, setDragSub] = useState(null);       // "sec/sub" of a subsection being dragged (dims its block)
   const [fabRight, setFabRight] = useState(76);       // bottom Arrange pill: px from the right edge (beside ⇄)
   const [saveState, setSaveState] = useState("");
   const [openItem, setOpenItem] = useState(null);
@@ -657,6 +658,7 @@ export default function ActFromHere() {
     const col = document.querySelector("[data-arrange-col]");
     if (!col) return;
     const r = col.getBoundingClientRect();
+    if (d.kind === "sub") { hitTestSub(d, r.left + r.width / 2); return; }
     let node = null;
     for (const el of document.elementsFromPoint(r.left + r.width / 2, d.y)) {
       const n = el.closest && el.closest("[data-drop]");
@@ -677,6 +679,31 @@ export default function ActFromHere() {
       d.target = { toSec, toSub: kind === "sec" ? "" : toSub, anchor: kind === "end" ? "end" : "top" };
       markTarget(d, node, "box");
     }
+  };
+
+  // A subsection drag only targets other subsection blocks (top half = before,
+  // bottom half = after, in that block's section) and section headers (after
+  // that section's last subsection; works collapsed). Item rows and the main
+  // lists are gaps: the last target is kept.
+  const hitTestSub = (d, x) => {
+    let node = null;
+    for (const el of document.elementsFromPoint(x, d.y)) {
+      const n = el.closest && el.closest('[data-subblock], [data-drop="sec"]');
+      if (n) { node = n; break; }
+    }
+    if (!node) return;
+    const toSec = node.getAttribute("data-sec");
+    if (!node.hasAttribute("data-subblock")) {
+      d.target = { toSec, anchor: "end" };
+      markTarget(d, node, "box");
+      return;
+    }
+    const subKey = node.getAttribute("data-sub");
+    if (toSec === d.sec && subKey === d.sub) { d.target = null; markTarget(d, null); return; } // over itself
+    const b = node.getBoundingClientRect();
+    const side = d.y > b.top + b.height / 2 ? "after" : "before";
+    d.target = { toSec, anchor: { subKey, side } };
+    markTarget(d, node, side);
   };
 
   const frame = (t) => {
@@ -717,11 +744,12 @@ export default function ActFromHere() {
     if (d.raf) cancelAnimationFrame(d.raf);
     markTarget(d, null);
     if (ghostRef.current) ghostRef.current.style.display = "none";
-    if (d.moved) setDragId(null);
+    if (d.moved) { setDragId(null); setDragSub(null); }
     return d;
   };
 
-  const beginDrag = (e, secKey, it) => {
+  // `subKey` set = dragging that subsection (its header's ≡); `it` then only supplies the ghost text.
+  const beginDrag = (e, secKey, it, subKey = "") => {
     if (!arranging || drag.current) return;
     if (e.pointerType === "mouse" && e.button !== 0) return;
     e.preventDefault(); // no text selection / focus change from the mouse
@@ -733,7 +761,7 @@ export default function ActFromHere() {
       safeTop = parseFloat(cs.paddingTop) || 0;
       safeBottom = parseFloat(cs.paddingBottom) || 0;
     }
-    drag.current = { id: it.id, sec: secKey, text: it.text, el, pointerId: e.pointerId, touch: e.pointerType !== "mouse",
+    drag.current = { kind: subKey ? "sub" : "item", id: subKey ? null : it.id, sub: subKey, sec: secKey, text: it.text, el, pointerId: e.pointerId, touch: e.pointerType !== "mouse",
       x0: e.clientX, y0: e.clientY, x: e.clientX, y: e.clientY, moved: false, target: null, markEl: null, markHow: "", raf: 0, lastT: 0, safeTop, safeBottom };
     const L = dragListeners.current;
     el.addEventListener("pointermove", L.move);
@@ -760,7 +788,7 @@ export default function ActFromHere() {
         if (sel && sel.removeAllRanges) sel.removeAllRanges();
         const g = ghostRef.current;
         if (g) { g.textContent = d.text; g.style.display = "block"; }
-        setDragId(d.id);
+        if (d.kind === "sub") setDragSub(d.sec + "/" + d.sub); else setDragId(d.id);
         d.raf = requestAnimationFrame(frame);
       }
       hitTest(d);
@@ -770,7 +798,7 @@ export default function ActFromHere() {
       if (!d || e.pointerId !== d.pointerId) return;
       const target = d.moved ? d.target : null;
       endDrag();
-      if (target) dropItem(d, target);
+      if (target) { if (d.kind === "sub") dropSub(d, target); else dropItem(d, target); }
     },
     cancel: () => { endDrag(); },
     lost: () => { endDrag(); }, // capture lost before pointerup: abort, never guess a drop
@@ -791,6 +819,31 @@ export default function ActFromHere() {
     const toEntry = next.sections.find((s) => s.key === target.toSec);
     const subName = target.toSub && ((toEntry.subs.find((x) => x.key === target.toSub)) || {}).name;
     offerUndo(st, sameList ? "Reordered" : `Moved to ${labelFor(target.toSec)}${subName ? " › " + subName : ""}`, undefined, [d.id]);
+  };
+
+  // Subsections: a drop reorders or moves one (its items travel with it); ⤴ makes one a section.
+  const dropSub = (d, target) => {
+    const st = cur();
+    const next = placeSub(st, { fromSec: d.sec, subKey: d.sub, toSec: target.toSec, anchor: target.anchor, newKey: "u" + uid() });
+    if (next === st) return; // same order (or stale target): nothing to save or sync
+    const ids = (st.items[d.sec] || []).filter((it) => it.sub === d.sub).map((it) => it.id);
+    persist({ ...next, items: { ...next.items, [target.toSec]: next.items[target.toSec].map((it) => (ids.includes(it.id) ? { ...it, fresh: true } : it)) } });
+    unflash(target.toSec, 1500);
+    offerUndo(st, d.sec === target.toSec ? "Reordered subsections" : `Moved ${d.text} to ${labelFor(target.toSec)}`, undefined, ids);
+  };
+
+  const promote = (secKey, subKey) => {
+    const st = cur();
+    const sec = st.sections.find((s) => s.key === secKey);
+    const sub = sec && sec.subs.find((x) => x.key === subKey);
+    if (!sub) return;
+    if (st.sections.length >= MAX_SECTIONS) { flash(`max ${MAX_SECTIONS} sections: delete one in ⚙ first`); return; }
+    const key = "s" + uid(); // same key form as the ⚙ "add new section" form
+    const next = promoteSub(st, { sec: secKey, subKey, newKey: key });
+    if (next === st) return;
+    persist({ ...next, items: { ...next.items, [key]: next.items[key].map((it) => ({ ...it, fresh: true })) } });
+    unflash(key, 1500);
+    offerUndo(st, `${sub.name} is now a section`, undefined, next.items[key].map((it) => it.id));
   };
 
   // The bottom Arrange pill sits 8 px left of the ⇄ sync button (pages-main.jsx,
@@ -1334,7 +1387,7 @@ export default function ActFromHere() {
                     const isRenaming = editingSub && editingSub.sec === sec.key && editingSub.key === sub.key;
                     const isPendingDelete = pendingDeleteSub && pendingDeleteSub.sec === sec.key && pendingDeleteSub.key === sub.key;
                     return (
-                      <div key={sub.key} style={{ borderTop: `1px solid ${C.cardEdge}` }}>
+                      <div key={sub.key} data-subblock="" data-sec={sec.key} data-sub={sub.key} style={{ borderTop: `1px solid ${C.cardEdge}`, opacity: dragSub === `${sec.key}/${sub.key}` ? 0.35 : 1 }}>
                         <div
                           role="button"
                           tabIndex={0}
@@ -1350,6 +1403,7 @@ export default function ActFromHere() {
                             const act = el ? el.getAttribute("data-act") : "";
                             if (act === "rename") { startSubRename(sec.key, sub.key, sub.name); return; }
                             if (act === "delete") { requestDeleteSub(sec.key, sub.key); return; }
+                            if (act === "promote") { promote(sec.key, sub.key); return; }
                             if (act === "noop") return;
                             toggleSub(sec.key, sub.key);
                           }}
@@ -1378,9 +1432,27 @@ export default function ActFromHere() {
                             {sec.key === "note" ? `${subItems.length}` : `${subOpen} open`}
                           </span>
                           {!isRenaming && (
-                            <span className={`flex items-center gap-1 flex-shrink-0 ${REVEAL_SUB} ${arranging ? "invisible" : ""}`}>
-                              <button data-act="rename" aria-label={`rename ${sub.name}`} className={`text-xs px-1.5 py-1 rounded-md focus:outline-none focus-visible:ring-2 ${TOUCH_ICON}`} style={{ color: C.dim, background: "transparent" }}>✎</button>
-                              <button data-act="delete" aria-label={`delete ${sub.name}`} className={`text-xs px-1.5 py-1 rounded-md focus:outline-none focus-visible:ring-2 ${TOUCH_ICON}`} style={{ color: C.red, background: "transparent" }}>🗑</button>
+                            <span className="relative flex items-center flex-shrink-0">
+                              <span className={`flex items-center gap-1 ${REVEAL_SUB} ${arranging ? "invisible" : ""}`}>
+                                <button data-act="rename" aria-label={`rename ${sub.name}`} className={`text-xs px-1.5 py-1 rounded-md focus:outline-none focus-visible:ring-2 ${TOUCH_ICON}`} style={{ color: C.dim, background: "transparent" }}>✎</button>
+                                <button data-act="delete" aria-label={`delete ${sub.name}`} className={`text-xs px-1.5 py-1 rounded-md focus:outline-none focus-visible:ring-2 ${TOUCH_ICON}`} style={{ color: C.red, background: "transparent" }}>🗑</button>
+                              </span>
+                              {arranging && (
+                                // overlaid on the (invisible) ✎/🗑 so entering Arrange mode moves nothing
+                                <span className="absolute inset-y-0 right-0 flex items-center gap-1">
+                                  <button data-act="promote" aria-label={`make ${sub.name} a section`} title="make it a section" className={`text-xs px-1.5 py-1 rounded-md focus:outline-none focus-visible:ring-2 [touch-action:manipulation] ${TOUCH_ICON}`} style={{ color: C.blue, background: "transparent" }}>{"⤴\uFE0E"}</button>
+                                  <span
+                                    ref={attachHandle}
+                                    data-act="noop"
+                                    data-subhandle={`${sec.key}/${sub.key}`}
+                                    aria-label={`drag ${sub.name}`}
+                                    title="drag to move"
+                                    onPointerDown={(e) => beginDrag(e, sec.key, { text: sub.name }, sub.key)}
+                                    className={`text-xs px-1.5 py-1 text-center cursor-grab select-none [touch-action:none] [-webkit-touch-callout:none] ${TOUCH_ICON}`}
+                                    style={{ color: C.blue }}
+                                  >≡</span>
+                                </span>
+                              )}
                             </span>
                           )}
                         </div>
