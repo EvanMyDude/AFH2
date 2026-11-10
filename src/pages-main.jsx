@@ -453,15 +453,29 @@ function SyncPanel() {
     : conflictSource === "legacy-unreadable" ? "the old Act From Here data couldn't be read — raw copy saved"
     : "a device's unsynced edits were superseded — backup saved";
   const noLegacyHint = !localStorage.getItem(LEGACY_DATA_KEY) && getMeta().savedAt === 1;
+  // How much of this device's data is safely in the gist. Read-only: pushedAt is
+  // the edit time of the last version that reached the gist (pushNow/adoptNow).
+  const backupLine = (() => {
+    if (!localStorage.getItem(K_GH_TOKEN)) return "export a backup to keep a copy off this device";
+    const m = getMeta();
+    if (m.savedAt > m.pushedAt) return "latest change not synced yet";
+    if (m.pushedAt <= 1) return "nothing backed up yet";
+    const d = new Date(m.pushedAt), today = new Date();
+    const time = d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+    const sameDay = d.toDateString() === today.toDateString();
+    const date = d.toLocaleDateString([], d.getFullYear() === today.getFullYear() ? { month: "short", day: "numeric" } : { year: "numeric", month: "short", day: "numeric" });
+    return "backed up through " + (sameDay ? time : `${date}, ${time}`);
+  })();
 
   return (
     <div style={{ position: "fixed", right: 14, bottom: "max(14px, env(safe-area-inset-bottom))", zIndex: 50, fontFamily: "-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Roboto, sans-serif" }}>
       {open && (
         <div className="rounded-2xl p-3 mb-2" style={{ background: P.card, border: `1px solid ${P.edge}`, width: 300, maxWidth: "calc(100vw - 28px)", color: P.text, boxShadow: "0 8px 30px rgba(0,0,0,0.6)" }}>
-          <div className="font-mono text-xs tracking-widest mb-2 flex items-center gap-2" style={{ color: P.dim }}>
+          <div className="font-mono text-xs tracking-widest flex items-center gap-2" style={{ color: P.dim }}>
             <span style={{ display: "inline-block", width: 8, height: 8, borderRadius: 8, background: statusDot }} />
             {statusLabel}
           </div>
+          <div className="font-mono text-xs mt-0.5 mb-2" style={{ color: P.faint, paddingLeft: 16 }} aria-label="backup status">{backupLine}</div>
           <label className="font-mono text-xs" style={{ color: P.faint }}>Anthropic API key (Sort It)</label>
           <input type="password" value={anthropicKey} onChange={(e) => setAnthropicKey(e.target.value)} placeholder="sk-ant-…" aria-label="anthropic api key"
             className="w-full text-xs font-mono outline-none rounded-md px-2 py-1.5 mt-1 mb-2" style={{ background: P.bg, color: P.text, border: `1px solid ${P.edge}` }} />
