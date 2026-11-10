@@ -1,6 +1,10 @@
-// Arrange mode's one state change: put an item at an exact spot in a list.
-// Pure, no React. Reordering is a permutation of items[sec] plus the item's
-// `sub`, both of which are already persisted, so no schema change is involved.
+// Arrange mode's state changes: put an item at an exact spot in a list, move a
+// subsection, or turn one into a section. Pure, no React. Each one rearranges
+// fields that are already persisted (the order of items[sec] and of
+// sections[].subs, item `sub`, a section entry with its label and collapse flag,
+// the same shape the ⚙ "add new section" form creates), so no schema change is
+// involved and older builds' migrate() keeps all of it.
+import { MAX_SECTIONS, KEY_RE } from "./model.js";
 
 // Which list an item renders in: its subsection if that still exists, else the
 // section's main list (""). The UI's main-list filter uses this too.
@@ -58,4 +62,80 @@ export const placeItem = (st, { id, fromSec, toSec, toSub = "", anchor }) => {
   const items = { ...st.items, [toSec]: next };
   if (fromSec !== toSec) items[fromSec] = without;
   return { ...st, items };
+};
+
+// Keys are compared case-insensitively, like migrate(): a clash there would be
+// re-keyed on load and the items would end up in the wrong subsection.
+const clashes = (keys, key) => keys.some((k) => k.toLowerCase() === key.toLowerCase());
+const freshKey = (key, keys) => typeof key === "string" && KEY_RE.test(key) && !(key in Object.prototype) && !clashes(keys, key);
+
+// placeSub(state, { fromSec, subKey, toSec, anchor, newKey })
+//   anchor: { subKey, side: "before" | "after" }  next to a subsection of toSec
+//           "end"                                 after toSec's last subsection
+//   newKey: used only when toSec already has a subsection with this key
+// Within a section only sections[].subs is permuted. Across sections the
+// subsection keeps its name and collapse flag, and its items (in order, with
+// their `sub`) move from items[fromSec] to the end of items[toSec]. Returns the
+// SAME object for a no-op or a stale request.
+export const placeSub = (st, { fromSec, subKey, toSec, anchor, newKey }) => {
+  const secs = st && Array.isArray(st.sections) ? st.sections : null;
+  const from = secs && secs.find((s) => s.key === fromSec);
+  const to = secs && secs.find((s) => s.key === toSec);
+  if (!from || !to || !st.items || !Array.isArray(st.items[fromSec])) return st;
+  const sub = (from.subs || []).find((x) => x.key === subKey);
+  if (!sub) return st;
+  const same = fromSec === toSec;
+  const target = (to.subs || []).filter((x) => !(same && x.key === subKey));
+
+  let at;
+  if (anchor === "end") at = target.length;
+  else if (anchor && typeof anchor === "object") {
+    if (same && anchor.subKey === subKey) return st;
+    const a = target.findIndex((x) => x.key === anchor.subKey);
+    if (a < 0) return st;
+    at = anchor.side === "after" ? a + 1 : a;
+  } else return st;
+
+  if (same) {
+    const subs = [...target.slice(0, at), sub, ...target.slice(at)];
+    if (subs.every((x, i) => x === from.subs[i])) return st;
+    return { ...st, sections: secs.map((s) => (s.key === fromSec ? { ...s, subs } : s)) };
+  }
+
+  let key = subKey;
+  if (clashes(target.map((x) => x.key), subKey)) {
+    if (!freshKey(newKey, target.map((x) => x.key))) return st;
+    key = newKey;
+  }
+  const moved = key === subKey ? sub : { ...sub, key };
+  const subs = [...target.slice(0, at), moved, ...target.slice(at)];
+  const travel = st.items[fromSec].filter((it) => it.sub === subKey).map((it) => (key === subKey ? it : { ...it, sub: key }));
+  return {
+    ...st,
+    sections: secs.map((s) => (s.key === fromSec ? { ...s, subs: s.subs.filter((x) => x.key !== subKey) } : s.key === toSec ? { ...s, subs } : s)),
+    items: { ...st.items, [fromSec]: st.items[fromSec].filter((it) => it.sub !== subKey), [toSec]: [...(st.items[toSec] || []), ...travel] },
+  };
+};
+
+// promoteSub(state, { sec, subKey, newKey })
+// The subsection becomes a section right after `sec`: key newKey, glyph "•",
+// no subsections, labels[newKey] = its name, collapsed if it was. Its items
+// move there in order and lose their `sub`. Returns the SAME object at
+// MAX_SECTIONS or for a stale request or an unusable newKey.
+export const promoteSub = (st, { sec, subKey, newKey }) => {
+  const secs = st && Array.isArray(st.sections) ? st.sections : null;
+  if (!secs || secs.length >= MAX_SECTIONS || !st.items || !Array.isArray(st.items[sec])) return st;
+  const i = secs.findIndex((s) => s.key === sec);
+  const sub = i < 0 ? null : (secs[i].subs || []).find((x) => x.key === subKey);
+  if (!sub) return st;
+  if (!freshKey(newKey, [...secs.map((s) => s.key), ...Object.keys(st.items)])) return st;
+  const travel = st.items[sec].filter((it) => it.sub === subKey).map(({ sub: _s, ...rest }) => rest);
+  const sections = [...secs.slice(0, i), { ...secs[i], subs: secs[i].subs.filter((x) => x.key !== subKey) }, { key: newKey, glyph: "•", subs: [] }, ...secs.slice(i + 1)];
+  return {
+    ...st,
+    sections,
+    items: { ...st.items, [sec]: st.items[sec].filter((it) => it.sub !== subKey), [newKey]: travel },
+    labels: { ...st.labels, [newKey]: sub.name },
+    collapsed: sub.collapsed ? { ...st.collapsed, [newKey]: true } : st.collapsed,
+  };
 };

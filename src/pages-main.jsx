@@ -4,7 +4,7 @@
 //   2. Anthropic fetch → injects the user's own API key (BYO-key pattern)
 //   3. Durability      → GitHub Gist sync (cross-device) + JSON export/import
 // Plus the one-time legacy import from the original ActFromHere app.
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { createRoot } from "react-dom/client";
 import ActFromHere from "./act-from-here.jsx";
 import { STORE_KEY, migrate, serialize, seed, clampSavedAt, looksLikeState } from "./model.js";
@@ -72,7 +72,7 @@ export async function findOrCreateGist(token, signal) {
   const listMine = async () => {
     const found = [];
     for (let page = 1; page <= 10; page++) {
-      const list = await fetch(`https://api.github.com/gists?per_page=100&page=${page}`, { headers: ghHeaders(token), signal });
+      const list = await fetch(`https://api.github.com/gists?per_page=100&page=${page}`, { headers: ghHeaders(token), signal, cache: "no-store" });
       if (list.status === 401) throw new Error("token rejected (401)");
       if (!list.ok) throw new Error(`gist list failed (${list.status})`); // never fall through and create a duplicate
       const gists = await list.json();
@@ -147,7 +147,9 @@ export async function pullFromGist({ timeoutMs = NET_TIMEOUT } = {}) {
   if (!token) return null;
   const t = withTimeout(timeoutMs);
   try {
-    const get = async () => fetch(`https://api.github.com/gists/${await findOrCreateGist(token, t.signal)}`, { headers: ghHeaders(token), signal: t.signal });
+    // no-store: GitHub's API answers are cacheable, and a pull served from the browser's
+    // cache could miss another device's push from the last minute.
+    const get = async () => fetch(`https://api.github.com/gists/${await findOrCreateGist(token, t.signal)}`, { headers: ghHeaders(token), signal: t.signal, cache: "no-store" });
     let res = await get();
     if (res.status === 404) { localStorage.removeItem(K_GIST_ID); res = await get(); } // cached id points at a deleted gist
     if (!res.ok) throw new Error(`pull failed (${res.status})`);
@@ -262,7 +264,7 @@ export function installAnthropicShim() {
   window.fetch = (url, opts = {}) => {
     if (url === "https://api.anthropic.com/v1/messages") {
       const key = localStorage.getItem(K_ANTHROPIC);
-      if (!key) return Promise.reject(new Error("No Anthropic API key set — open the ⇄ panel. Your dump stays put."));
+      if (!key) return Promise.reject(new Error("No Anthropic API key set: add one in the ⇄ panel"));
       // The artifact environment capped max_tokens at 1000; a big dump's JSON
       // gets truncated at that cap. On the user's own key there's no such limit.
       let body = opts.body;
@@ -410,7 +412,7 @@ function SyncPanel() {
     return () => sync.listeners.delete(fn);
   }, []);
 
-  const msgTimer = { current: null };
+  const msgTimer = useRef(null); // one timer across renders, so an old one can't clear a newer message
   const say = (m, ms) => { setMsg(m); if (msgTimer.current) clearTimeout(msgTimer.current); if (ms) msgTimer.current = setTimeout(() => setMsg(""), ms); };
   const saveKeys = async () => {
     const a = anthropicKey.trim();
@@ -453,15 +455,29 @@ function SyncPanel() {
     : conflictSource === "legacy-unreadable" ? "the old Act From Here data couldn't be read — raw copy saved"
     : "a device's unsynced edits were superseded — backup saved";
   const noLegacyHint = !localStorage.getItem(LEGACY_DATA_KEY) && getMeta().savedAt === 1;
+  // How much of this device's data is safely in the gist. Read-only: pushedAt is
+  // the edit time of the last version that reached the gist (pushNow/adoptNow).
+  const backupLine = (() => {
+    if (!localStorage.getItem(K_GH_TOKEN)) return "export a backup to keep a copy off this device";
+    const m = getMeta();
+    if (m.savedAt > m.pushedAt) return "latest change not synced yet";
+    if (m.pushedAt <= 1) return "nothing backed up yet";
+    const d = new Date(m.pushedAt), today = new Date();
+    const time = d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+    const sameDay = d.toDateString() === today.toDateString();
+    const date = d.toLocaleDateString([], d.getFullYear() === today.getFullYear() ? { month: "short", day: "numeric" } : { year: "numeric", month: "short", day: "numeric" });
+    return "backed up through " + (sameDay ? time : `${date}, ${time}`);
+  })();
 
   return (
     <div style={{ position: "fixed", right: 14, bottom: "max(14px, env(safe-area-inset-bottom))", zIndex: 50, fontFamily: "-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Roboto, sans-serif" }}>
       {open && (
         <div className="rounded-2xl p-3 mb-2" style={{ background: P.card, border: `1px solid ${P.edge}`, width: 300, maxWidth: "calc(100vw - 28px)", color: P.text, boxShadow: "0 8px 30px rgba(0,0,0,0.6)" }}>
-          <div className="font-mono text-xs tracking-widest mb-2 flex items-center gap-2" style={{ color: P.dim }}>
+          <div className="font-mono text-xs tracking-widest flex items-center gap-2" style={{ color: P.dim }}>
             <span style={{ display: "inline-block", width: 8, height: 8, borderRadius: 8, background: statusDot }} />
             {statusLabel}
           </div>
+          <div className="font-mono text-xs mt-0.5 mb-2" style={{ color: P.faint, paddingLeft: 16 }} aria-label="backup status">{backupLine}</div>
           <label className="font-mono text-xs" style={{ color: P.faint }}>Anthropic API key (Sort It)</label>
           <input type="password" value={anthropicKey} onChange={(e) => setAnthropicKey(e.target.value)} placeholder="sk-ant-…" aria-label="anthropic api key"
             className="w-full text-xs font-mono outline-none rounded-md px-2 py-1.5 mt-1 mb-2" style={{ background: P.bg, color: P.text, border: `1px solid ${P.edge}` }} />
