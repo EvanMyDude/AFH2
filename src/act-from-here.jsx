@@ -47,7 +47,8 @@ const TOUCH_TALL = "[@media(pointer:coarse)]:min-h-[40px]";
 const TOUCH_ICON = "[@media(pointer:coarse)]:min-w-[40px] [@media(pointer:coarse)]:py-3 [@media(pointer:coarse)]:-my-2";
 // Bordered chips can't grow visibly; an invisible ::after extends the tap area instead.
 // (8 px below stops just short of the section card, 10 px above is free space.)
-const TOUCH_CHIP = "relative after:absolute after:inset-x-0 after:-top-2.5 after:-bottom-2 after:content-['']";
+const TOUCH_HIT = "after:absolute after:inset-x-0 after:-top-2.5 after:-bottom-2 after:content-['']";
+const TOUCH_CHIP = "relative " + TOUCH_HIT; // (a fixed-position button uses TOUCH_HIT alone: `relative` would override `fixed`)
 
 // Smooth open/close with unknown content height and no unmount: grid rows 0fr↔1fr.
 // overflow-clip (not hidden) so a focused child can't scroll the box on iOS;
@@ -72,6 +73,7 @@ export default function ActFromHere() {
   const [toastUndo, setToastUndo] = useState(false); // the toast carries an "undo" button
   const [arranging, setArranging] = useState(false);  // Arrange mode (local UI state, never persisted)
   const [dragId, setDragId] = useState(null);         // item being dragged (dims its row)
+  const [fabRight, setFabRight] = useState(76);       // bottom Arrange pill: px from the right edge (beside ⇄)
   const [saveState, setSaveState] = useState("");
   const [openItem, setOpenItem] = useState(null);
   const [editing, setEditing] = useState(null);         // { sec, id, text, url, next }
@@ -789,6 +791,23 @@ export default function ActFromHere() {
     const subName = target.toSub && ((toEntry.subs.find((x) => x.key === target.toSub)) || {}).name;
     offerUndo(st, sameList ? "Reordered" : `Moved to ${labelFor(target.toSec)}${subName ? " › " + subName : ""}`, undefined, [d.id]);
   };
+
+  // The bottom Arrange pill sits 8 px left of the ⇄ sync button (pages-main.jsx,
+  // fixed bottom-right). ⇄'s width depends on the device's fonts, so measure
+  // its left edge instead of guessing; 76 px is the fallback before it exists.
+  const loaded = data !== null;
+  useEffect(() => {
+    if (!loaded) return undefined;
+    const measure = () => {
+      const b = document.querySelector('button[aria-label="sync and backup panel"]');
+      if (!b) return;
+      const r = b.getBoundingClientRect();
+      if (r.width) setFabRight(Math.round(document.documentElement.clientWidth - r.left + 8));
+    };
+    measure();
+    window.addEventListener("resize", measure);
+    return () => window.removeEventListener("resize", measure);
+  }, [loaded]);
 
   // Esc: abort an active drag, else leave Arrange mode (not while typing in a field).
   useEffect(() => {
@@ -1572,17 +1591,31 @@ export default function ActFromHere() {
         </div>
       </div>
 
-      {/* Arrange mode: exit pill (bottom-left; ⇄ is bottom-right), drag ghost, safe-area probe.
+      {/* Arrange mode: drag ghost and safe-area probe.
           Rendered here at the root: inside a Collapsible, contain:layout would trap position:fixed. */}
+      {/* bottom Arrange toggle: always reachable, beside ⇄ (the top chip stays too). z-51 keeps it
+          above the sync panel's own fixed container (z-50), whose transparent bottom row spans the
+          open panel's width; the pill never overlaps the panel itself. */}
+      <button
+        data-arrange-fab=""
+        onClick={() => (arranging ? stopArrange() : startArrange())}
+        aria-label={arranging ? "done arranging" : "arrange items"}
+        aria-pressed={arranging}
+        className={`fixed z-[51] font-mono text-xs px-3 py-1.5 rounded-full focus:outline-none focus-visible:ring-2 [touch-action:manipulation] ${TOUCH_HIT} ${arranging ? "font-bold" : ""}`}
+        style={{
+          right: fabRight,
+          bottom: "max(14px, env(safe-area-inset-bottom))",
+          background: arranging ? C.blue : C.card,
+          color: arranging ? "#fff" : C.dim,
+          border: `1px solid ${arranging ? C.blue : C.cardEdge}`,
+          boxShadow: "0 4px 16px rgba(0,0,0,0.5)",
+        }}
+      >
+        {arranging ? "✓ done" : "↕ arrange"}
+      </button>
+
       {arranging && (
         <>
-          <button
-            onClick={stopArrange}
-            className="fixed z-40 font-mono text-xs font-bold px-3 py-1.5 rounded-full shadow-lg focus:outline-none focus-visible:ring-2 [touch-action:manipulation]"
-            style={{ left: 14, bottom: "max(14px, env(safe-area-inset-bottom))", background: C.blue, color: "#fff", border: `1px solid ${C.blue}` }}
-          >
-            ✓ done
-          </button>
           <div
             ref={ghostRef}
             aria-hidden="true"
