@@ -4,7 +4,7 @@
 //   2. Anthropic fetch → injects the user's own API key (BYO-key pattern)
 //   3. Durability      → GitHub Gist sync (cross-device) + JSON export/import
 // Plus the one-time legacy import from the original ActFromHere app.
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { createRoot } from "react-dom/client";
 import ActFromHere from "./act-from-here.jsx";
 import { STORE_KEY, migrate, serialize, seed, clampSavedAt, looksLikeState } from "./model.js";
@@ -262,7 +262,7 @@ export function installAnthropicShim() {
   window.fetch = (url, opts = {}) => {
     if (url === "https://api.anthropic.com/v1/messages") {
       const key = localStorage.getItem(K_ANTHROPIC);
-      if (!key) return Promise.reject(new Error("No Anthropic API key set — open the ⇄ panel. Your dump stays put."));
+      if (!key) return Promise.reject(new Error("No Anthropic API key set: add one in the ⇄ panel"));
       // The artifact environment capped max_tokens at 1000; a big dump's JSON
       // gets truncated at that cap. On the user's own key there's no such limit.
       let body = opts.body;
@@ -410,7 +410,7 @@ function SyncPanel() {
     return () => sync.listeners.delete(fn);
   }, []);
 
-  const msgTimer = { current: null };
+  const msgTimer = useRef(null); // one timer across renders, so an old one can't clear a newer message
   const say = (m, ms) => { setMsg(m); if (msgTimer.current) clearTimeout(msgTimer.current); if (ms) msgTimer.current = setTimeout(() => setMsg(""), ms); };
   const saveKeys = async () => {
     const a = anthropicKey.trim();

@@ -30,6 +30,7 @@ const readDraft = () => { try { return localStorage.getItem(DRAFT_KEY) || ""; } 
 // scrolling and the long-press callout are blocked with native listeners.
 const preventTouch = (e) => { if (e.cancelable) e.preventDefault(); };
 const AUTOSCROLL_ZONE = 72; // px from the top/bottom edge where a drag scrolls the page
+const SORT_TIMEOUT_MS = 90000; // a Sort It request that hangs longer falls back (lines into the catch-all, undoable)
 const metaLabel = (key) => (has(SECTION_META, key) ? SECTION_META[key].label : "UNTITLED");
 const metaHint = (key) => (has(SECTION_META, key) ? SECTION_META[key].hint : "nothing here yet");
 
@@ -847,6 +848,8 @@ export default function ActFromHere() {
       return;
     }
     setSorting(true);
+    const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
+    const timeout = ctrl ? setTimeout(() => ctrl.abort(), SORT_TIMEOUT_MS) : null;
     try {
       const liveSecs = stNow.sections;
       const bucketLines = liveSecs
@@ -855,6 +858,7 @@ export default function ActFromHere() {
       const keyEnum = liveSecs.map((s) => s.key).join("|");
       const response = await fetch("https://api.anthropic.com/v1/messages", {
         method: "POST",
+        signal: ctrl ? ctrl.signal : undefined,
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           model: "claude-sonnet-5",
@@ -894,7 +898,7 @@ export default function ActFromHere() {
       unflashAll(1800);
     } catch (e) {
       console.error(e);
-      const reason = String(e && e.message ? e.message : e).slice(0, 90);
+      const reason = e && e.name === "AbortError" ? `timed out after ${SORT_TIMEOUT_MS / 1000} s` : String(e && e.message ? e.message : e).slice(0, 90);
       // fallback: raw lines land in the catch-all so nothing is lost
       const st = cur();
       const catchAll = catchAllKey(st.sections);
@@ -904,6 +908,7 @@ export default function ActFromHere() {
       consumeDump(sent);
       offerUndo(st, `Sort failed (${reason}) — dumped into ${labelFor(catchAll)} as-is, nothing lost`, sent);
     } finally {
+      if (timeout) clearTimeout(timeout);
       setSorting(false);
     }
   };
