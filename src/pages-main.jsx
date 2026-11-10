@@ -72,7 +72,7 @@ export async function findOrCreateGist(token, signal) {
   const listMine = async () => {
     const found = [];
     for (let page = 1; page <= 10; page++) {
-      const list = await fetch(`https://api.github.com/gists?per_page=100&page=${page}`, { headers: ghHeaders(token), signal });
+      const list = await fetch(`https://api.github.com/gists?per_page=100&page=${page}`, { headers: ghHeaders(token), signal, cache: "no-store" });
       if (list.status === 401) throw new Error("token rejected (401)");
       if (!list.ok) throw new Error(`gist list failed (${list.status})`); // never fall through and create a duplicate
       const gists = await list.json();
@@ -147,7 +147,9 @@ export async function pullFromGist({ timeoutMs = NET_TIMEOUT } = {}) {
   if (!token) return null;
   const t = withTimeout(timeoutMs);
   try {
-    const get = async () => fetch(`https://api.github.com/gists/${await findOrCreateGist(token, t.signal)}`, { headers: ghHeaders(token), signal: t.signal });
+    // no-store: GitHub's API answers are cacheable, and a pull served from the browser's
+    // cache could miss another device's push from the last minute.
+    const get = async () => fetch(`https://api.github.com/gists/${await findOrCreateGist(token, t.signal)}`, { headers: ghHeaders(token), signal: t.signal, cache: "no-store" });
     let res = await get();
     if (res.status === 404) { localStorage.removeItem(K_GIST_ID); res = await get(); } // cached id points at a deleted gist
     if (!res.ok) throw new Error(`pull failed (${res.status})`);
