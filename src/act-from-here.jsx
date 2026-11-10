@@ -82,7 +82,7 @@ export default function ActFromHere() {
   const [adding, setAdding] = useState(false);
   const [newSec, setNewSec] = useState({ glyph: "", name: "" });
   const [addingItem, setAddingItem] = useState(null); // { sec, sub } with an open quick-add form
-  const [newItem, setNewItem] = useState({ text: "", url: "" });
+  const [newItem, setNewItem] = useState({ text: "", next: "", url: "" });
   const [addingSub, setAddingSub] = useState(null);   // section key with an open new-subsection form
   const [newSubName, setNewSubName] = useState("");
   const [editingSub, setEditingSub] = useState(null); // { sec, key, value }
@@ -295,24 +295,26 @@ export default function ActFromHere() {
   // ---------- quick add (per section or subsection) ----------
   // Enter commits and keeps the form open for rapid consecutive entry;
   // tapping away commits and closes; Esc discards; empty text creates nothing.
-  const openNewItem = (sec, sub) => { addingRef.current = { sec, sub }; setAddingItem({ sec, sub }); setNewItem({ text: "", url: "" }); };
-  const closeNewItem = () => { addingRef.current = null; setAddingItem(null); setNewItem({ text: "", url: "" }); };
+  const openNewItem = (sec, sub) => { addingRef.current = { sec, sub }; setAddingItem({ sec, sub }); setNewItem({ text: "", next: "", url: "" }); };
+  const closeNewItem = () => { addingRef.current = null; setAddingItem(null); setNewItem({ text: "", next: "", url: "" }); };
 
   const commitNewItem = (keepOpen) => {
     const form = addingRef.current;
     if (!form) return; // already closed (Esc / committed) — a stale blur must not add again
     const { sec: secKey, sub } = form;
     const text = newItem.text.trim();
+    const next = newItem.next.trim();
     const url = newItem.url.trim();
-    if (!text) { if (!keepOpen) closeNewItem(); return; }
+    if (!text) { if (!keepOpen) closeNewItem(); return; } // a next step or link alone creates nothing
     const st = cur();
     if (!st.items[secKey]) { closeNewItem(); return; } // section deleted mid-entry
     const secEntry = st.sections.find((s) => s.key === secKey);
     const item = { id: uid(), text, done: false, fresh: true };
     if (url) item.url = url;
+    if (next) item.next = next;
     if (sub && secEntry && secEntry.subs.some((x) => x.key === sub)) item.sub = sub;
     persist({ ...st, items: { ...st.items, [secKey]: [item, ...st.items[secKey]] } });
-    setNewItem({ text: "", url: "" });
+    setNewItem({ text: "", next: "", url: "" });
     if (!keepOpen) closeNewItem();
     else setTimeout(() => { if (addItemInputRef.current) addItemInputRef.current.focus(); }, 0);
     unflash(secKey, 1800);
@@ -947,6 +949,18 @@ export default function ActFromHere() {
           aria-label={`new item in ${displayLabel}`}
           className="w-full text-sm leading-snug outline-none rounded-md px-2 py-1"
           style={{ ...inputStyle, border: `1px solid ${C.blue}` }}
+        />
+        <input
+          value={newItem.next}
+          onChange={(e) => setNewItem({ ...newItem, next: e.target.value })}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") commitNewItem(true);
+            else if (e.key === "Escape") closeNewItem();
+          }}
+          placeholder="→ next step — optional"
+          aria-label={`new item next step in ${displayLabel}`}
+          className="w-full mt-1.5 text-xs outline-none rounded-md px-2 py-1"
+          style={inputStyle}
         />
         <input
           value={newItem.url}

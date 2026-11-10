@@ -30,6 +30,7 @@ Act From Here 2 is the original single-page React PWA (paste-dump sorter + secti
 - On touch the item menu opens on tap (the 220 ms double-click wait is mouse-only); checkbox, section glyph, menu controls, subsection ✎/🗑 and "＋ subsection" have ~40 px touch areas; desktop renders identically. `Collapsible` gained `min-w-0`, fixing cards that a long subsection name widened past the phone screen.
 - Undo (6 s toast) for item delete, clear done, move and Sort It.
 - **Arrange mode** ("↕ arrange", left of "clear done"): a ≡ handle replaces each checkbox; drag to reorder within a list, between a section's main list and its subsections (both ways), onto a collapsed subsection, or onto another section's header (top of its main list; easiest with sections collapsed). The page autoscrolls near the edges. Every drop is undoable. Not persisted; off on every load.
+- **2026-11-09:** the "＋ add item" form has a "→ next step" field between the text and the link (same order as the edit form), so a new item can get its next step when it's created.
 
 Depth: `docs/plans/2026-09-14-feat-afh2-subsections-big-ticket-plan.md` (design + every decision and its reason), `todos/` (ten review findings, all resolved, each with the reasoning), PR #1 description.
 
@@ -92,6 +93,7 @@ AFH2/
 - Subsection header uses one delegated `onClick` with `data-act` (`rename`/`delete`/`noop`), so inner buttons need no `stopPropagation`. No dblclick on group headers (deliberate).
 - Hover reveal classes: `REVEAL_SEC` (section-level `group`) and `REVEAL_SUB` (`group/sub` named group). The hide rule uses `[@media(hover:hover)_and_(pointer:fine)]` to match what Tailwind's `hoverOnlyWhenSupported` emits.
 - Sorter: raw `fetch` to the Anthropic Messages API, model `claude-sonnet-5`, bucket labels JSON-quoted, response capped at 500 items, fallback dumps lines into `catchAllKey`.
+- **Quick add:** `newItem` is `{ text, next, url }`. `commitNewItem` writes `next`/`url` only when non-empty (same rules as `commitItemEdit`), and empty text creates nothing even with a next step or link typed. Enter in any of the three fields commits and keeps the form open, Esc discards, and tapping away or `afh:flush` commits (guarded by `addingRef`, invariant 10).
 - **PASTE DUMP draft:** every change to the box goes through `changeDump`, which mirrors it to the local-only key `afh2-dump-draft` (removed when the box is empty); `dump` state is initialized from it, so pasted text survives the app being killed in the background or an adoption reload. Nothing writes the key on load. A finished sort (success or fallback) calls `consumeDump(sent)`, which clears only the text it sorted: anything typed into the box during "Sorting…" stays (`dumpRef` holds the live value).
 
 ### `src/pages-main.jsx` — storage, sync, boot
