@@ -5,6 +5,7 @@ import {
 } from "./model.js";
 import { applySeed } from "./seed-big-ticket.js";
 import { placeItem, groupOf, placeSub, promoteSub } from "./arrange.js";
+import { merge3, restoreItems } from "./merge.js";
 
 // ---------- palette (Apple Notes dark, his native habitat) ----------
 const C = {
@@ -44,7 +45,7 @@ const REVEAL_SUB = REVEAL + " group-hover/sub:opacity-100 group-focus-within/sub
 // Touch-only sizing (pointer:coarse) so small controls get ~40 px targets on the
 // phone while mouse layouts stay pixel-identical. Equal padding/negative margin
 // grows the hit area without moving neighbours where the row has room for it.
-const TOUCH_TALL = "[@media(pointer:coarse)]:min-h-[40px]";
+export const TOUCH_TALL = "[@media(pointer:coarse)]:min-h-[40px]"; // also used by the ⇄ panel (pages-main.jsx)
 const TOUCH_ICON = "[@media(pointer:coarse)]:min-w-[40px] [@media(pointer:coarse)]:py-3 [@media(pointer:coarse)]:-my-2";
 // Bordered chips can't grow visibly; an invisible ::after extends the tap area instead.
 // (8 px below stops just short of the section card, 10 px above is free space.)
@@ -111,6 +112,9 @@ export default function ActFromHere() {
   const ghostRef = useRef(null);
   const safeProbeRef = useRef(null);
   const latest = useRef(null);     // newest state, source of truth for writes AND mutations
+  const storedRef = useRef(null);  // the afh2-v1 string this tab last read or wrote (see syncWithStored)
+  const reconcileRef = useRef(null);
+  const restoreRef = useRef(null);
   const saveTimer = useRef(null);  // debounce handle
   const busy = useRef(false);      // a write is in flight
   const dirty = useRef(false);     // state changed while writing
@@ -144,11 +148,15 @@ export default function ActFromHere() {
       try {
         const migrated = migrate(JSON.parse(res.value));
         latest.current = migrated;
+        storedRef.current = res.value;
         setData(migrated);
         const canonical = serialize(migrated);
         // Persist the canonical shape WITHOUT touching the watermark — nothing was
         // edited, and a fresh timestamp could outrank real edits on another device.
-        if (canonical !== res.value) window.storage.set(STORE_KEY, canonical, { touch: false }).catch((e) => console.error("canonical rewrite", e));
+        if (canonical !== res.value) {
+          window.storage.set(STORE_KEY, canonical, { touch: false }).catch((e) => console.error("canonical rewrite", e));
+          noteStored(canonical);
+        }
       } catch (e) {
         console.error("load failed", e);
         try { localStorage.setItem(CORRUPT_KEY, String(res.value)); } catch (e2) { /* quota — nothing else to do */ }
@@ -156,6 +164,66 @@ export default function ActFromHere() {
       }
     })();
   }, []);
+
+  // ---------- other tabs ----------
+  // Every tab on this device shares afh2-v1. When another tab (or the sync
+  // layer) replaced it after this tab last read or wrote it, this tab's copy is
+  // stale, and writing it would bring back old data and sync that everywhere.
+  // Instead this tab's own unsaved edits (measured against what it last saw)
+  // are merged onto the stored copy, and the tab continues from the result.
+  // Synchronous, because it runs inside afh:flush.
+  const readStored = () => { try { return localStorage.getItem(STORE_KEY); } catch (e) { return null; } };
+  // after a write call: remember it only if it actually landed (frozen or quota → it didn't)
+  const noteStored = (out) => { if (readStored() === out) storedRef.current = out; };
+  const syncWithStored = () => {
+    const stored = readStored();
+    const mine = storedRef.current;
+    if (stored === null || mine === null || stored === mine || !latest.current) return;
+    let theirs;
+    try { theirs = migrate(JSON.parse(stored)); } catch (e) { return; } // unreadable: never act on it
+    let base = null;
+    try { base = migrate(JSON.parse(mine)); } catch (e) { base = null; }
+    const ours = latest.current;
+    const next = serialize(ours) === mine ? theirs : merge3(base, ours, theirs);
+    storedRef.current = stored;
+    latest.current = next;
+    setData(next);
+  };
+  // Another tab wrote afh2-v1 (storage event), or the sync layer did (afh:external).
+  reconcileRef.current = () => {
+    if (window.storage && window.storage.frozen) return; // a reload is already on its way
+    syncWithStored();
+    if (latest.current && serialize(latest.current) !== readStored()) scheduleSave(); // our merged edits still need writing
+  };
+  useEffect(() => {
+    const onStored = (e) => {
+      if (e.type === "storage" && e.key !== STORE_KEY) return;
+      if (reconcileRef.current) reconcileRef.current();
+    };
+    const onRestore = (e) => { if (restoreRef.current && e.detail) restoreRef.current(e.detail.data, e.detail.ids); };
+    window.addEventListener("storage", onStored);
+    window.addEventListener("afh:external", onStored);
+    window.addEventListener("afh:restore", onRestore);
+    return () => {
+      window.removeEventListener("storage", onStored);
+      window.removeEventListener("afh:external", onStored);
+      window.removeEventListener("afh:restore", onRestore);
+    };
+  }, []);
+  // ⇄ history → "put back": the chosen items of a saved version go back onto the
+  // current state (restoreItems, never a whole-state restore), as an undoable edit.
+  restoreRef.current = (data, ids) => {
+    const st = cur();
+    if (!st || typeof data !== "string" || !Array.isArray(ids) || !ids.length) return;
+    let version;
+    try { version = migrate(JSON.parse(data)); } catch (e) { return; }
+    const next = restoreItems(st, version, ids);
+    if (next === st) { flash("nothing to put back — it's all here already"); return; }
+    const back = new Set(ids);
+    persist({ ...next, items: Object.fromEntries(Object.entries(next.items).map(([k, a]) => [k, a.map((it) => (back.has(it.id) ? { ...it, fresh: true } : it))])) });
+    unflashAll(1500);
+    offerUndo(st, `Put back ${ids.length} item${ids.length === 1 ? "" : "s"}`, undefined, ids);
+  };
 
   // ---------- save ----------
   // Writes are debounced + serialized: rapid taps coalesce into ONE storage.set.
@@ -168,7 +236,13 @@ export default function ActFromHere() {
     let ok = false;
     for (let attempt = 0; attempt < 3 && !ok; attempt++) {
       try {
-        await window.storage.set(STORE_KEY, serialize(latest.current));
+        syncWithStored();
+        const out = serialize(latest.current);
+        if (out !== readStored()) {
+          const w = window.storage.set(STORE_KEY, out);
+          noteStored(out);
+          await w;
+        }
         ok = true;
       } catch (e) {
         console.error("save attempt", attempt + 1, "failed", e);
@@ -583,15 +657,16 @@ export default function ActFromHere() {
     if (addingRef.current) commitNewItem(false);
     if (addingSubRef.current) commitNewSub();
     if (saveTimer.current) { clearTimeout(saveTimer.current); saveTimer.current = null; }
-    const st = latest.current;
-    if (!st) return;
-    const out = serialize(st);
-    let stored = null;
-    try { stored = localStorage.getItem(STORE_KEY); } catch (e) { /* fall through to write */ }
+    if (!latest.current) return;
+    syncWithStored(); // a stale tab merges onto what another tab stored instead of overwriting it
+    const out = serialize(latest.current);
+    const stored = readStored();
     if (stored !== null && out === stored) { setSaveState((s) => (s === "saving" ? "" : s)); return; }
     // Write directly (the adapter's setItem is synchronous before its first await)
     // instead of going through flush()'s busy gate, which could defer the write.
-    window.storage.set(STORE_KEY, out).then(() => {
+    const w = window.storage.set(STORE_KEY, out);
+    noteStored(out);
+    w.then(() => {
       setSaveState("saved");
       setTimeout(() => setSaveState((s) => (s === "saved" ? "" : s)), 1200);
     }).catch((e) => { console.error("flush write failed", e); setSaveState("error"); });
