@@ -55,13 +55,15 @@ AFH2/
   src/
     model.js              PURE STATE MODEL, no React. The only place that knows the persisted shape.
     seed-big-ticket.js    Big Ticket manifest (BIG_TICKET) + applySeed(state) (idempotent)
-    arrange.js            Arrange mode's pure state change: groupOf(it, subKeys), placeItem(state, {...})
+    arrange.js            Arrange mode's pure state changes: groupOf, placeItem, placeSub, promoteSub
+    merge.js              merge3(base, local, remote): three-way merge of two versions (other tabs, other devices)
     act-from-here.jsx     the UI component (≈1200 lines)
     pages-main.jsx        storage adapter, gist sync, import/export, first boot, SyncPanel, boot()
   test/
     model.test.js         migrate/serialize/seed/catchAllKey/safeHref/clampSavedAt/looksLikeState
     seed.test.js          manifest sanity + applySeed idempotency / deletions / missing section / round-trip
     arrange.test.js       placeItem: reorder, main list ↔ subsection, cross-section, top/end anchors, no-op + stale requests, round-trip
+    merge.test.js         merge3: identities, adds/deletes/edits per field, moves, order, sections/subsections, no-base union, seeded fuzz
   docs/plans/             the design plan (living document; checkboxes reflect verified ACs)
   docs/screenshots/       full-page + viewport shots, walkthrough frames, afh2-walkthrough.gif
   todos/                  review findings 001–010, all `complete`
@@ -87,6 +89,7 @@ AFH2/
 - **Save path:** `scheduleSave` (400 ms debounce) → `flush()` → `window.storage.set(STORE_KEY, serialize(latest))` with 3 retries. Load: `storage.get` → `JSON.parse` → `migrate`; if the canonical string differs from what was stored, it is re-written with `{ touch: false }` (no timestamp bump).
 - **Transient form state** (`editing`, `editingCat`, `editingGlyph`, `editingSub`, `addingItem`, `addingSub`) is mirrored in refs (`editingRef`, … `addingSubRef`) that are cleared synchronously in every close path. Commit functions bail when the ref is null. This exists because Chrome fires `blur` on an input removed while focused and React dispatches that stale handler; without the guards Esc could still commit and Enter could double-add. **Keep the pattern when adding any new inline form.**
 - **Collapsing = tapping away:** `clearTransient(secKey, subKey)` commits (never discards) forms inside the collapsing scope, then the toggle reads `cur()` *after* those commits.
+- **Other tabs (`storedRef`, `syncWithStored`):** every tab on a device shares `afh2-v1`. `storedRef` is the string this tab last read or wrote. Every write path (`flush()`, the `afh:flush` handler; the canonical rewrite on load just records what it wrote) first calls `syncWithStored()`: if the stored string is no longer `storedRef` (another tab, or the sync layer, replaced it), the tab takes the stored state, or, when it has unsaved edits of its own, `merge3(base = storedRef, ours, stored)`, and only then writes (and only if that differs from what is stored). A `storage` event on `afh2-v1` (another tab) or `afh:external` (the sync layer, same tab) runs the same reconcile right away, without a reload; when the merge holds edits of its own it schedules a save. Before this (2026-11-21), a stale tab's `afh:flush` on becoming visible wrote its old copy with a fresh timestamp and pushed it, erasing another device's edits everywhere; `merge3` is in `src/merge.js`.
 - **`afh:flush` listener** (registered once, calls `onFlushRef`): commits every open form, cancels the debounce, and writes directly through `storage.set` if the serialized state differs from what is stored. The sync layer dispatches this event synchronously before reading meta on hide/pagehide and before any adoption.
 - **`<Collapsible open>`**: `grid` + `grid-template-rows 0fr↔1fr` transition, inner `min-h-0 min-w-0 overflow-clip [contain:layout]` with `inert={!open}`. Used for sections and subsections. `min-w-0` matters: without it the content's min-content width (a long subsection name, before truncation) widened the card past the column on a phone (a 66-character name made the page 716 px wide at 390 px).
 - **Item tap vs double-click:** `onPointerDown` on the item text records `pointerType`. Only a mouse keeps the `CLICK_DELAY` (220 ms) wait that separates single click (menu) from double click (edit). Touch, pen and keyboard open the menu immediately; a second click on the same item within `CLICK_DELAY` of opening is ignored (`menuOpened`), so a double-tap never blinks the menu closed and the `dblclick` that follows still edits. Chromium turns two touch taps up to ~500 ms apart into a `dblclick` (old and new builds alike); what iOS does is a device check.
@@ -141,6 +144,7 @@ Watermark rules (`afh2-meta`): `savedAt = 1` means "untouched default seed" (nev
 11. Subsection/section keys come from `uid()` prefixed (`s…`, `u…`, or the stable seed keys); keys must satisfy `KEY_RE` and never be `Object.prototype` names.
 12. Local-only UI keys (`afh2-dump-draft`) live outside `afh2-v1`: written only on user input, never on load, never synced, never exported, never read by the sync engine. Anything that must sync goes through `migrate`/`serialize` and needs the owner's OK (`CLAUDE.md`).
 13. Never restore a whole-state snapshot (undo or anything like it) unless the persisted form is still exactly what the action produced (`serialize(cur()) === after`). Otherwise it silently rolls back later edits and syncs that rollback to every device.
+14. A tab never writes `afh2-v1` over a value it hasn't seen: every component write goes through `syncWithStored()` first. Code that replaces `afh2-v1` under a running app either reloads it (`frozen`, invariant 5) or dispatches `afh:external`.
 
 ## 6. Dev loop
 
