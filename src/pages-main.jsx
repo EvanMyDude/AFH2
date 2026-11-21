@@ -8,6 +8,7 @@ import { useState, useEffect, useRef } from "react";
 import { createRoot } from "react-dom/client";
 import ActFromHere from "./act-from-here.jsx";
 import { STORE_KEY, migrate, serialize, seed, clampSavedAt, looksLikeState } from "./model.js";
+import { merge3 } from "./merge.js";
 import { applySeed } from "./seed-big-ticket.js";
 
 // AFH2 owns its own keys. Both apps share this origin's localStorage, and the
@@ -21,10 +22,15 @@ const K_GIST_ID = "afh2-gist-id";
 const GIST_DESC = "afh2-data";           // constant → second device finds the same gist
 const GIST_FILE = "afh2.json";
 const CONFLICT_KEY = "afh2-conflict-backup";
+// Local-only, never synced or exported: the afh2-v1 string this browser last
+// knew to be in the gist (what it last pushed or adopted). It is the common
+// ancestor for merging when another device pushed in the meantime.
+const BASE_KEY = "afh2-sync-base";
 const LEGACY_DATA_KEY = "afh-v1";        // read once, never written
 const LEGACY_META_KEY = "afh-meta";
 const PUSH_DEBOUNCE = 2500;
 const NET_TIMEOUT = 4000;
+const FOCUS_RECHECK = 15000; // window focus re-checks the gist at most this often
 const MAX_PUSH_BYTES = 900000; // GitHub truncates gist file content above ~1 MB
 
 const now = () => Date.now();
@@ -37,6 +43,17 @@ const getMeta = () => {
 const setMeta = (m) => localStorage.setItem(META_KEY, JSON.stringify(m));
 const safeSet = (k, v) => { try { localStorage.setItem(k, v); return true; } catch (e) { console.error("stash failed", k, e); return false; } };
 const flushApp = () => { try { window.dispatchEvent(new Event("afh:flush")); } catch (e) { console.error(e); } };
+const getBase = () => { try { return localStorage.getItem(BASE_KEY); } catch (e) { return null; } };
+// Remote/stored data in canonical form, or null if it isn't recognizable state.
+const canonical = (raw) => {
+  try { const p = JSON.parse(raw); return looksLikeState(p) ? serialize(migrate(p)) : null; } catch (e) { return null; }
+};
+const parseState = (raw) => { try { return raw ? migrate(JSON.parse(raw)) : null; } catch (e) { return null; } };
+// Merge this device's edits and another device's onto their common base. Without
+// a base (nothing known in common) it is a union that never drops an item.
+const mergeStrings = (baseRaw, localRaw, remoteRaw) => serialize(merge3(parseState(baseRaw), parseState(localRaw), parseState(remoteRaw)));
+// The sync layer replaced afh2-v1 under the running app: let it take that in (no reload).
+const tellApp = () => { try { window.dispatchEvent(new Event("afh:external")); } catch (e) { console.error(e); } };
 
 // ---------- sync engine (gist) ----------
 export const sync = {
@@ -112,7 +129,33 @@ async function pushNow() {
   if (m.savedAt <= m.pushedAt) { if (sync.status !== "error") setStatus("ok"); return; } // nothing stranded (also dedupes hidden+pagehide)
   setStatus("pending");
   try {
-    const payload = { savedAt: m.savedAt, data: localStorage.getItem(DATA_KEY) };
+    // Read the gist first. If another device pushed since this one last synced
+    // (its content is no longer our base), merge instead of overwriting it.
+    let remote = null;
+    try { remote = await pullFromGist(); }
+    catch (e) {
+      // Network or auth trouble: the PATCH would fail too, so try again later.
+      // Broken remote content (bad timestamp, truncated, unparsable): nothing to
+      // merge with, and overwriting it is how it gets repaired, as before.
+      if (!(e instanceof SyntaxError || /timestamp invalid|too large/.test(String(e && e.message)))) throw e;
+      console.error("gist push: remote unreadable, pushing without a merge:", e);
+    }
+    let data = localStorage.getItem(DATA_KEY);
+    let savedAt = getMeta().savedAt;
+    const theirs = remote && remote.data ? canonical(remote.data) : null;
+    const base = getBase();
+    const moved = theirs !== null && theirs !== data && (base !== null ? theirs !== base : remote.savedAt > m.pushedAt);
+    if (moved) {
+      const merged = mergeStrings(base, data, theirs);
+      savedAt = Math.max(now(), remote.savedAt + 1); // newer than both, so every device adopts the merge
+      if (merged !== data) {
+        localStorage.setItem(DATA_KEY, merged);
+        data = merged;
+        tellApp();
+      }
+      setMeta({ ...getMeta(), savedAt });
+    }
+    const payload = { savedAt, data };
     const body = JSON.stringify({ files: { [GIST_FILE]: { content: JSON.stringify(payload) } } });
     if (body.length > MAX_PUSH_BYTES) throw new Error("data too large to sync (>900 KB) — export a backup and clear done items");
     const patch = async () => fetch(`https://api.github.com/gists/${await findOrCreateGist(token)}`, {
@@ -127,6 +170,7 @@ async function pushNow() {
     if (res.status === 404) { localStorage.removeItem(K_GIST_ID); res = await patch(); } // cached id points at a deleted gist
     if (!res.ok) throw new Error(`push failed (${res.status})`);
     setMeta({ ...getMeta(), pushedAt: payload.savedAt });
+    safeSet(BASE_KEY, payload.data);
     setStatus("ok");
   } catch (e) {
     console.error("gist push:", e);
@@ -185,16 +229,25 @@ async function adoptNow() {
       if (local === clean) {
         // same content, newer stamp — align meta, no reload needed
         setMeta({ savedAt: remote.savedAt, pushedAt: remote.savedAt });
+        safeSet(BASE_KEY, clean);
         setStatus("ok");
         return false;
       }
       // Local holds edits that never reached the gist AND remote moved past them:
-      // last-write-wins takes remote, but the loser is stashed — never silently lost.
+      // keep both — merge the local edits onto the remote version and push the
+      // result (savedAt above the remote's, pushedAt at it, so it is stranded and
+      // goes out on the reload's boot).
       if (m.savedAt > m.pushedAt && local !== null) {
-        safeSet(CONFLICT_KEY, JSON.stringify({ source: "afh2-local", savedAt: m.savedAt, stashedAt: now(), data: local }));
+        const merged = mergeStrings(getBase(), local, clean);
+        localStorage.setItem(DATA_KEY, merged);
+        setMeta({ savedAt: Math.max(now(), remote.savedAt + 1), pushedAt: remote.savedAt });
+        safeSet(BASE_KEY, clean);
+        setStatus("ok");
+        return true;
       }
       localStorage.setItem(DATA_KEY, clean);
       setMeta({ savedAt: remote.savedAt, pushedAt: remote.savedAt });
+      safeSet(BASE_KEY, clean);
       setStatus("ok");
       return true;
     }
@@ -234,13 +287,18 @@ export function installStorageAdapter() {
     // user didn't edit anything and a fresh stamp could outrank real edits elsewhere.
     async set(key, value, opts) {
       if (window.storage.frozen) return { key, value, shared: false, frozen: true };
-      const existedBefore = key !== DATA_KEY || localStorage.getItem(DATA_KEY) !== null;
+      const prev = key === DATA_KEY ? localStorage.getItem(DATA_KEY) : null;
+      const existedBefore = key !== DATA_KEY || prev !== null;
       localStorage.setItem(key, value);
       if (key === DATA_KEY && !(opts && opts.touch === false && existedBefore)) {
         if (!existedBefore) {
           setMeta({ savedAt: 1, pushedAt: 1 });
         } else {
-          setMeta({ ...getMeta(), savedAt: now() });
+          // First edit since the last sync: what it replaces is what the gist
+          // holds, so keep it as the merge base (written only on an edit).
+          const m = getMeta();
+          if (m.savedAt <= m.pushedAt && prev !== null) safeSet(BASE_KEY, prev);
+          setMeta({ ...m, savedAt: now() });
           schedulePush();
         }
       }
@@ -549,6 +607,15 @@ export async function boot(mountNode) {
     if (m0.savedAt > m0.pushedAt) pushToGist();
   }
   // returning to the tab/app: pick up edits made on another device
+  let lastCheck = 0;
+  const checkRemote = () => {
+    if (!localStorage.getItem(K_GH_TOKEN)) return;
+    lastCheck = now();
+    flushApp(); // commit any half-typed form so it can't be lost to a reload
+    const m = getMeta();
+    if (m.savedAt > m.pushedAt) { pushToGist(); return; } // ship our edits (merged with the gist's if it moved)
+    adoptAndReload();
+  };
   document.addEventListener("visibilitychange", async () => {
     if (document.visibilityState === "hidden") {
       // Land the app's pending write FIRST (synchronous), then decide. iOS
@@ -564,11 +631,20 @@ export async function boot(mountNode) {
       return;
     }
     if (document.visibilityState !== "visible") return;
-    if (!localStorage.getItem(K_GH_TOKEN)) return;
-    flushApp(); // commit any half-typed form so it can't be lost to a reload
+    checkRemote();
+  });
+  // A computer tab can stay visible for hours; focusing its window counts as
+  // coming back. Unlike a tab switch it doesn't land open forms first (that
+  // would close them on every Cmd-Tab): unsynced edits are pushed (merging
+  // if the gist moved), else the gist is peeked at and only a newer version
+  // goes through the usual adopt-and-reload.
+  window.addEventListener("focus", () => {
+    if (document.visibilityState !== "visible" || !localStorage.getItem(K_GH_TOKEN) || now() - lastCheck < FOCUS_RECHECK) return;
+    lastCheck = now();
     const m = getMeta();
-    if (m.savedAt > m.pushedAt) { pushToGist(); return; } // our edits win; ship them
-    adoptAndReload();
+    if (m.savedAt > m.pushedAt) { pushToGist(); return; }
+    serial(async () => { try { const r = await pullFromGist(); return !!(r && r.data && r.savedAt > getMeta().savedAt); } catch (e) { return false; } })
+      .then((newer) => { if (newer) adoptAndReload(); });
   });
   // leaving: best-effort final push of anything pending
   window.addEventListener("pagehide", () => {
