@@ -233,3 +233,55 @@ test("seeded markers from both sides are kept (a seed applied on either device s
   const r = freeze({ ...clone(b), seeded: ["two"] });
   assert.deepEqual([...merge3(b, l, r).seeded].sort(), ["one", "two"]);
 });
+
+import { diffVersion, restoreItems } from "../src/merge.js";
+
+test("diffVersion: missing, changed (any field or place) and added, in list order", () => {
+  const v = freeze(base());
+  const now = freeze(edit(v, (c) => {
+    delItem(c, "a2"); delItem(c, "c1");
+    setItem(c, "a1", { done: true });
+    c.items.week = c.items.week.map((i) => (i.id === "b1" ? { ...i, sub: undefined } : i));
+    c.items.note.push({ id: "new", text: "new", done: false });
+  }));
+  const d = diffVersion(now, v);
+  assert.deepEqual(d.missing.map((x) => x.id), ["a2", "c1"]);
+  assert.deepEqual(d.changed.map((x) => x.id), ["a1", "b1"]);
+  assert.deepEqual(d.added.map((x) => x.id), ["new"]);
+  assert.equal(d.missing[0].then.next, "n2");
+  assert.equal(d.changed[1].then.sub, "bt");
+  assert.equal(d.changed[1].now.sub, "");
+  assert.deepEqual(diffVersion(v, v), { missing: [], changed: [], added: [] });
+});
+
+test("restoreItems puts chosen items back where the version had them, and nothing else", () => {
+  const v = freeze(base());
+  const now = freeze(edit(v, (c) => { delItem(c, "a2"); delItem(c, "b2"); setItem(c, "a3", { done: false, text: "A3 now" }); c.items.week.unshift({ id: "keep", text: "added since", done: false }); }));
+  const out = restoreItems(now, v, ["a2", "b2"]);
+  assert.deepEqual(ids(out, "week"), ["keep", "a1", "b1", "a2", "b2", "a3"]);
+  assert.deepEqual(item(out, "a2"), { id: "a2", text: "A2", done: false, next: "n2", sec: "week" });
+  assert.equal(item(out, "b2").sub, "bt");
+  assert.equal(item(out, "a3").text, "A3 now", "not chosen → untouched");
+  const changed = restoreItems(now, v, ["a3"]);
+  assert.deepEqual(item(changed, "a3"), { id: "a3", text: "A3", done: true, url: "https://example.com/3", sec: "week" });
+  assert.equal(restoreItems(now, v, []), now);
+  assert.equal(restoreItems(now, v, ["keep", "a1", "nope"]), now, "unchanged, added-since and unknown ids are ignored");
+  assert.equal(S(migrate(JSON.parse(S(out)))), S(out));
+});
+
+test("restoreItems: a gone section falls back to the catch-all, a gone subsection to the main list, a moved item moves back", () => {
+  const v = freeze(base());
+  const now = freeze(edit(v, (c) => {
+    c.sections = c.sections.filter((s) => s.key !== "buy"); delete c.items.buy;
+    c.sections[0].subs = c.sections[0].subs.filter((x) => x.key !== "bt");
+    delItem(c, "b1");
+    const a1 = c.items.week.shift(); c.items.note.push(a1);
+  }));
+  const out = restoreItems(now, v, ["c1", "b1", "a1"]);
+  assert.ok(ids(out, "note").includes("c1"), "buy is gone → catch-all");
+  assert.equal(item(out, "b1").sec, "week");
+  assert.equal(item(out, "b1").sub, undefined, "bt is gone → main list");
+  assert.equal(item(out, "a1").sec, "week");
+  assert.equal(ids(out, "week")[0], "a1");
+  assert.ok(!ids(out, "note").includes("a1"));
+});

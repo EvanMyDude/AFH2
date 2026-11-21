@@ -6,9 +6,9 @@
 // Plus the one-time legacy import from the original ActFromHere app.
 import { useState, useEffect, useRef } from "react";
 import { createRoot } from "react-dom/client";
-import ActFromHere from "./act-from-here.jsx";
-import { STORE_KEY, migrate, serialize, seed, clampSavedAt, looksLikeState } from "./model.js";
-import { merge3 } from "./merge.js";
+import ActFromHere, { TOUCH_TALL } from "./act-from-here.jsx";
+import { STORE_KEY, SECTION_META, migrate, serialize, seed, clampSavedAt, looksLikeState } from "./model.js";
+import { merge3, diffVersion } from "./merge.js";
 import { applySeed } from "./seed-big-ticket.js";
 
 // AFH2 owns its own keys. Both apps share this origin's localStorage, and the
@@ -260,6 +260,39 @@ async function adoptNow() {
   }
 }
 
+// ---------- sync history (read-only) ----------
+// GitHub keeps every version pushed to the gist. These only read, through
+// serial(), and only a gist this device already knows (never create one).
+const HISTORY_TIMEOUT = 10000;
+export const listVersions = (page = 1) => serial(async () => {
+  const token = localStorage.getItem(K_GH_TOKEN), id = localStorage.getItem(K_GIST_ID);
+  if (!token || !id) return { versions: [], more: false };
+  const t = withTimeout(HISTORY_TIMEOUT);
+  try {
+    const res = await fetch(`https://api.github.com/gists/${encodeURIComponent(id)}/commits?per_page=100&page=${page}`, { headers: ghHeaders(token), signal: t.signal, cache: "no-store" });
+    if (!res.ok) throw new Error(`couldn't list versions (${res.status})`);
+    const list = await res.json();
+    const versions = (Array.isArray(list) ? list : []).filter((c) => c && typeof c.version === "string").map((c) => ({ version: c.version, at: Date.parse(c.committed_at) || 0 }));
+    return { versions, more: Array.isArray(list) && list.length === 100 };
+  } finally { t.done(); }
+});
+// → { data: canonical afh2-v1 string, or null for a version that holds none }
+export const fetchVersion = (version) => serial(async () => {
+  const token = localStorage.getItem(K_GH_TOKEN), id = localStorage.getItem(K_GIST_ID);
+  if (!token || !id || !/^[0-9a-f]{7,64}$/i.test(String(version))) throw new Error("unknown version");
+  const t = withTimeout(HISTORY_TIMEOUT);
+  try {
+    const res = await fetch(`https://api.github.com/gists/${encodeURIComponent(id)}/${version}`, { headers: ghHeaders(token), signal: t.signal });
+    if (!res.ok) throw new Error(`couldn't load that version (${res.status})`);
+    const g = await res.json();
+    const file = g.files && g.files[GIST_FILE];
+    if (!file || !file.content) return { data: null };
+    if (file.truncated) throw new Error("that version is too large to show");
+    const parsed = JSON.parse(file.content);
+    return { data: parsed && typeof parsed.data === "string" ? canonical(parsed.data) : null };
+  } finally { t.done(); }
+});
+
 // Adopt + reload, with the freeze flag so nothing (debounce, hide-flush) can
 // write the pre-adoption state back over the adopted blob during the reload.
 const adoptAndReload = async () => {
@@ -455,7 +488,136 @@ export async function firstBoot(mount) {
 }
 
 // ---------- settings panel ----------
+// "3:42 PM" today, "Nov 9, 3:42 PM" this year, "Nov 9, 2025, 3:42 PM" before.
+// withSeconds for saved versions, which can be seconds apart.
+const formatTime = (t, withSeconds) => new Date(t).toLocaleTimeString([], withSeconds ? { hour: "numeric", minute: "2-digit", second: "2-digit" } : { hour: "numeric", minute: "2-digit" });
+const formatWhen = (t, withSeconds) => {
+  const d = new Date(t), today = new Date();
+  const time = formatTime(t, withSeconds);
+  if (d.toDateString() === today.toDateString()) return time;
+  const date = d.toLocaleDateString([], d.getFullYear() === today.getFullYear() ? { month: "short", day: "numeric" } : { year: "numeric", month: "short", day: "numeric" });
+  return `${date}, ${time}`;
+};
+const dayLabel = (t) => {
+  const d = new Date(t), today = new Date(), y = new Date(); y.setDate(today.getDate() - 1);
+  if (d.toDateString() === today.toDateString()) return "today";
+  if (d.toDateString() === y.toDateString()) return "yesterday";
+  return d.toLocaleDateString([], d.getFullYear() === today.getFullYear() ? { weekday: "short", month: "short", day: "numeric" } : { year: "numeric", month: "short", day: "numeric" });
+};
 const P = { bg: "#0A0A0B", card: "#151517", edge: "#26262B", text: "#F2F2F4", dim: "#9A9AA3", faint: "#5B5B64", blue: "#0A84FF", red: "#FF453A", green: "#30D158" };
+
+// Where an item sits, in the state that has it: "SECTION › SUBSECTION".
+const placeName = (st, rec) => {
+  if (!st || !rec) return "";
+  const sec = (st.sections || []).find((s) => s.key === rec.sec);
+  const name = (st.labels && st.labels[rec.sec]) || (Object.prototype.hasOwnProperty.call(SECTION_META, rec.sec) ? SECTION_META[rec.sec].label : "UNTITLED");
+  const sub = rec.sub && sec && (sec.subs || []).find((x) => x.key === rec.sub);
+  return sub ? `${name} › ${sub.name}` : name;
+};
+// What is different now about an item that changed since the version.
+const whatChanged = (then, now, nowSt) => {
+  const parts = [];
+  if (then.text !== now.text) parts.push(`now “${now.text.length > 40 ? now.text.slice(0, 39) + "…" : now.text}”`);
+  if (then.done !== now.done) parts.push(now.done ? "now done" : "now not done");
+  if (then.sec !== now.sec || then.sub !== now.sub) parts.push(`now in ${placeName(nowSt, now)}`);
+  if (then.next !== now.next) parts.push("next step changed");
+  if (then.url !== now.url) parts.push("link changed");
+  return parts.join(" · ");
+};
+
+const histBtn = "font-mono text-xs px-2 py-1 rounded-md";
+const histBtnStyle = { color: P.text, border: `1px solid ${P.edge}`, background: "transparent" };
+function HistoryView({ hist, ver, ticked, onMore, onOpen, onBack, onTick, onTickAll, onPutBack }) {
+  const note = (text, color = P.dim) => <div className="font-mono text-xs mt-2" style={{ color }}>{text}</div>;
+  const scroll = { maxHeight: "min(45vh, 320px)" };
+  if (ver) {
+    const d = ver.diff;
+    let thenSt = null, nowSt = null;
+    try { thenSt = ver.data ? migrate(JSON.parse(ver.data)) : null; nowSt = migrate(JSON.parse(localStorage.getItem(DATA_KEY))); } catch (e) { /* shown as unreadable below */ }
+    const row = (x, extra) => (
+      <label key={x.id} className={`flex items-start gap-2 py-1.5 cursor-pointer ${TOUCH_TALL}`} style={{ borderTop: `1px solid ${P.edge}` }}>
+        <input type="checkbox" checked={ticked.has(x.id)} onChange={() => onTick(x.id)} className="mt-0.5 flex-shrink-0" style={{ accentColor: P.blue }} />
+        <span className="flex-1 min-w-0">
+          <span className="block text-xs break-words" style={{ color: x.then.done ? P.faint : P.text, textDecoration: x.then.done ? "line-through" : "none" }}>{x.then.text}</span>
+          <span className="block font-mono text-xs" style={{ color: P.faint }}>{placeName(thenSt, x.then)}{extra ? ` · ${extra}` : ""}</span>
+        </span>
+      </label>
+    );
+    const group = (label, list, render) => list.length > 0 && (
+      <div className="mt-2">
+        <div className="flex items-center justify-between gap-2 mb-1">
+          <div className="font-mono text-xs" style={{ color: P.faint }}>{label} · {list.length}</div>
+          {render && <button onClick={() => onTickAll(list)} className={histBtn} style={histBtnStyle}>{list.every((x) => ticked.has(x.id)) ? "untick all" : "tick all"}</button>}
+        </div>
+        {list.map((x) => (render ? render(x) : (
+          <div key={x.id} className="py-1.5" style={{ borderTop: `1px solid ${P.edge}` }}>
+            <span className="block text-xs break-words" style={{ color: P.dim }}>{x.now.text}</span>
+            <span className="block font-mono text-xs" style={{ color: P.faint }}>{placeName(nowSt, x.now)}</span>
+          </div>
+        )))}
+      </div>
+    );
+    return (
+      <div className="mt-2 pt-2" style={{ borderTop: `1px solid ${P.edge}` }} aria-label="sync history">
+        <div className="flex items-center gap-2">
+          <button onClick={onBack} className={histBtn} style={histBtnStyle}>‹ versions</button>
+          <span className="font-mono text-xs" style={{ color: P.text }}>{formatWhen(ver.at, true)}</span>
+        </div>
+        {ver.state === "loading" && note("loading this version…")}
+        {ver.state === "error" && note("history failed: " + ver.error)}
+        {ver.state === "ready" && !ver.data && note("this version holds no data", P.faint)}
+        {ver.state === "ready" && ver.data && !d && note("history failed: couldn't read this version")}
+        {ver.state === "ready" && d && (
+          <>
+            {!d.missing.length && !d.changed.length && !d.added.length && note("same as now", P.faint)}
+            <div className="overflow-y-auto" style={scroll}>
+              {group("not here now", d.missing, (x) => row(x))}
+              {group("different now", d.changed, (x) => row(x, whatChanged(x.then, x.now, nowSt)))}
+              {group("new since", d.added, null)}
+            </div>
+            {(d.missing.length > 0 || d.changed.length > 0) && (
+              <div className="flex justify-end mt-2">
+                <button onClick={onPutBack} disabled={!ticked.size} className="font-mono text-xs px-3 py-1.5 rounded-full font-bold"
+                  style={{ background: ticked.size ? P.blue : P.edge, color: ticked.size ? "#fff" : P.dim, cursor: ticked.size ? "pointer" : "default" }}>
+                  put back {ticked.size}
+                </button>
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    );
+  }
+  let lastDay = "";
+  return (
+    <div className="mt-2 pt-2" style={{ borderTop: `1px solid ${P.edge}` }} aria-label="sync history">
+      <div className="font-mono text-xs" style={{ color: P.faint }}>saved versions in your gist · pick one to compare with now</div>
+      {hist.state === "ready" && !hist.versions.length && note("no saved versions yet", P.faint)}
+      {hist.versions.length > 0 && (
+        <div className="overflow-y-auto mt-1" style={scroll}>
+          {hist.versions.map((v, i) => {
+            const day = dayLabel(v.at);
+            const head = day !== lastDay;
+            lastDay = day;
+            return (
+              <div key={v.version}>
+                {head && <div className="font-mono text-xs mt-2 mb-1" style={{ color: P.faint }}>{day}</div>}
+                <button onClick={() => onOpen(v)} className={`w-full text-left flex items-baseline justify-between gap-2 py-1.5 font-mono text-xs ${TOUCH_TALL}`}
+                  style={{ color: P.text, background: "transparent", borderTop: `1px solid ${P.edge}` }}>
+                  <span>{formatTime(v.at, true)}</span>
+                  <span style={{ color: P.faint }}>{i === 0 ? "current ›" : "›"}</span>
+                </button>
+              </div>
+            );
+          })}
+          {hist.more && hist.state !== "loading" && <div className="mt-2"><button onClick={onMore} className={histBtn} style={histBtnStyle}>older</button></div>}
+        </div>
+      )}
+      {hist.state === "loading" && note("loading versions…")}
+      {hist.state === "error" && note("history failed: " + hist.error)}
+    </div>
+  );
+}
 
 function SyncPanel() {
   const [open, setOpen] = useState(false);
@@ -507,6 +669,39 @@ function SyncPanel() {
   try { conflictSource = conflictRaw ? (JSON.parse(conflictRaw).source || "") : ""; } catch { conflictSource = ""; }
   const downloadConflict = () => { if (conflictRaw) download("afh2-conflict-backup.json", conflictRaw); };
 
+  // ---- history: the gist's saved versions, and putting items back from one ----
+  const [hist, setHist] = useState(null); // null = closed | { state: "loading"|"ready"|"error", versions, more, page, error }
+  const [ver, setVer] = useState(null);   // null | { version, at, state, data, diff, error }
+  const [ticked, setTicked] = useState(() => new Set());
+  const loadVersions = (page) => {
+    setHist((h) => ({ versions: [], more: false, ...(h || {}), page, state: "loading", error: "" }));
+    listVersions(page)
+      .then((r) => setHist((h) => ({ ...h, state: "ready", versions: page === 1 ? r.versions : [...h.versions, ...r.versions], more: r.more })))
+      .catch((e) => setHist((h) => ({ ...h, state: "error", error: String((e && e.message) || e) })));
+  };
+  const toggleHistory = () => {
+    if (hist) { setHist(null); setVer(null); return; }
+    loadVersions(1);
+  };
+  const openVersion = (v) => {
+    setTicked(new Set());
+    setVer({ ...v, state: "loading" });
+    fetchVersion(v.version)
+      .then((r) => {
+        let diff = null;
+        try { if (r.data) diff = diffVersion(migrate(JSON.parse(localStorage.getItem(DATA_KEY))), migrate(JSON.parse(r.data))); } catch (e) { diff = null; }
+        setVer((cur) => (cur && cur.version === v.version ? { ...cur, state: "ready", data: r.data, diff } : cur));
+      })
+      .catch((e) => setVer((cur) => (cur && cur.version === v.version ? { ...cur, state: "error", error: String((e && e.message) || e) } : cur)));
+  };
+  const tick = (id) => setTicked((t) => { const n = new Set(t); if (n.has(id)) n.delete(id); else n.add(id); return n; });
+  const tickAll = (list) => setTicked((t) => { const n = new Set(t); const all = list.every((x) => n.has(x.id)); for (const x of list) { if (all) n.delete(x.id); else n.add(x.id); } return n; });
+  const putBack = () => {
+    if (!ver || !ver.data || !ticked.size) return;
+    window.dispatchEvent(new CustomEvent("afh:restore", { detail: { data: ver.data, ids: [...ticked] } }));
+    setOpen(false); setHist(null); setVer(null); setTicked(new Set()); // the undo toast sits under the open panel on a phone
+  };
+
   const statusDot = sync.status === "ok" ? P.green : sync.status === "pending" ? P.blue : sync.status === "error" ? P.red : P.faint;
   const statusLabel = { off: "sync off — this device only", ok: "synced to gist", pending: "syncing…", error: "sync error: " + sync.lastError, pulling: "checking remote…" }[sync.status] || sync.status;
   const conflictLabel = conflictSource === "legacy" ? "this device's old Act From Here copy was kept as a backup (the synced AFH2 data won)"
@@ -520,17 +715,13 @@ function SyncPanel() {
     const m = getMeta();
     if (m.savedAt > m.pushedAt) return "latest change not synced yet";
     if (m.pushedAt <= 1) return "nothing backed up yet";
-    const d = new Date(m.pushedAt), today = new Date();
-    const time = d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
-    const sameDay = d.toDateString() === today.toDateString();
-    const date = d.toLocaleDateString([], d.getFullYear() === today.getFullYear() ? { month: "short", day: "numeric" } : { year: "numeric", month: "short", day: "numeric" });
-    return "backed up through " + (sameDay ? time : `${date}, ${time}`);
+    return "backed up through " + formatWhen(m.pushedAt);
   })();
 
   return (
     <div style={{ position: "fixed", right: 14, bottom: "max(14px, env(safe-area-inset-bottom))", zIndex: 50, fontFamily: "-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Roboto, sans-serif" }}>
       {open && (
-        <div className="rounded-2xl p-3 mb-2" style={{ background: P.card, border: `1px solid ${P.edge}`, width: 300, maxWidth: "calc(100vw - 28px)", color: P.text, boxShadow: "0 8px 30px rgba(0,0,0,0.6)" }}>
+        <div className="rounded-2xl p-3 mb-2" style={{ background: P.card, border: `1px solid ${P.edge}`, width: 300, maxWidth: "calc(100vw - 28px)", maxHeight: "calc(100dvh - 80px)", overflowY: "auto", color: P.text, boxShadow: "0 8px 30px rgba(0,0,0,0.6)" }}>
           <div className="font-mono text-xs tracking-widest flex items-center gap-2" style={{ color: P.dim }}>
             <span style={{ display: "inline-block", width: 8, height: 8, borderRadius: 8, background: statusDot }} />
             {statusLabel}
@@ -550,7 +741,13 @@ function SyncPanel() {
             </label>
             <button onClick={() => { setStatus("pulling"); adoptAndReload(); }}
               className="font-mono text-xs px-2 py-1.5 rounded-md" style={{ color: P.text, border: `1px solid ${P.edge}`, background: "transparent" }}>pull</button>
+            {localStorage.getItem(K_GH_TOKEN) && (
+              <button onClick={toggleHistory} aria-expanded={!!hist}
+                className="font-mono text-xs px-2 py-1.5 rounded-md" style={{ color: P.text, border: `1px solid ${P.edge}`, background: "transparent" }}>history {hist ? "▴" : "▾"}</button>
+            )}
           </div>
+          {hist && <HistoryView hist={hist} ver={ver} ticked={ticked} onMore={() => loadVersions(hist.page + 1)} onOpen={openVersion}
+            onBack={() => { setVer(null); setTicked(new Set()); }} onTick={tick} onTickAll={tickAll} onPutBack={putBack} />}
           {msg && <div className="font-mono text-xs mt-2" style={{ color: P.dim }}>{msg}</div>}
           {noLegacyHint && (
             <div className="font-mono text-xs mt-2" style={{ color: P.dim }}>had Act From Here data? enter your GitHub token (after opening AFH2 on the device that has it) or import a backup to bring it over.</div>

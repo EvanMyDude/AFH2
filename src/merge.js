@@ -179,3 +179,56 @@ export const merge3 = (base0, local, remote) => {
   raw.seeded = [...new Set([...(remote.seeded || []), ...(local.seeded || [])])];
   return migrate(raw);
 };
+
+// ---------- sync history: compare a saved version with now, put items back ----------
+
+// How a saved version differs from the current state, item by item:
+//   missing: items the version had that are gone now
+//   changed: items in both whose text, done, link, next step, section or subsection differ
+//   added:   items that are here now but weren't in the version
+// Each entry: { id, then, now } with flat records { sec, sub, text, done, url, next } (absent side = null),
+// in the order the version (missing, changed) or the current state (added) lists them.
+export const diffVersion = (current, version) => {
+  const C = itemRecords(current), V = itemRecords(version);
+  const out = { missing: [], changed: [], added: [] };
+  for (const [id, v] of V) {
+    const c = C.get(id);
+    if (!c) out.missing.push({ id, then: v, now: null });
+    else if (!same(c, v, ITEM_FIELDS)) out.changed.push({ id, then: v, now: c });
+  }
+  for (const [id, c] of C) if (!V.has(id)) out.added.push({ id, then: null, now: c });
+  return out;
+};
+
+// Put the chosen items back the way the version had them, on top of the current
+// state (never a whole-state restore): a missing item is re-inserted, a changed
+// one gets the version's text, done, link, next step and place. Its place is the
+// version's section when that still exists, else the catch-all; its subsection
+// only if that section still has it; its position right after the item that
+// preceded it in the version, when that item is still in the same list,
+// else first. Ids that aren't missing or changed are ignored.
+export const restoreItems = (current, version, ids) => {
+  const want = new Set(ids);
+  const C = itemRecords(current), V = itemRecords(version);
+  const secs = new Map((current.sections || []).map((s) => [s.key, new Set((s.subs || []).map((x) => x.key))]));
+  const keys = [...secs.keys()];
+  const fallback = keys.includes("note") ? "note" : keys[keys.length - 1];
+  const items = Object.fromEntries(keys.map((k) => [k, ((current.items && current.items[k]) || []).slice()]));
+  let touched = 0;
+  for (const id of want) {
+    const v = V.get(id), c = C.get(id);
+    if (!v || (c && same(c, v, ITEM_FIELDS)) || !fallback) continue;
+    if (c) items[c.sec] = items[c.sec].filter((it) => it.id !== id);
+    const sec = secs.has(v.sec) ? v.sec : fallback;
+    const rec = { id, text: v.text, done: v.done };
+    if (v.url) rec.url = v.url;
+    if (v.next) rec.next = v.next;
+    if (sec === v.sec && v.sub && secs.get(sec).has(v.sub)) rec.sub = v.sub;
+    const order = listOf(version, v.sec);
+    const before = order.slice(0, order.indexOf(id)).reverse().find((p) => items[sec].some((it) => it.id === p));
+    const at = before ? items[sec].findIndex((it) => it.id === before) + 1 : 0;
+    items[sec].splice(at, 0, rec);
+    touched++;
+  }
+  return touched ? migrate({ ...current, items }) : current;
+};

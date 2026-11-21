@@ -5,7 +5,7 @@ import {
 } from "./model.js";
 import { applySeed } from "./seed-big-ticket.js";
 import { placeItem, groupOf, placeSub, promoteSub } from "./arrange.js";
-import { merge3 } from "./merge.js";
+import { merge3, restoreItems } from "./merge.js";
 
 // ---------- palette (Apple Notes dark, his native habitat) ----------
 const C = {
@@ -45,7 +45,7 @@ const REVEAL_SUB = REVEAL + " group-hover/sub:opacity-100 group-focus-within/sub
 // Touch-only sizing (pointer:coarse) so small controls get ~40 px targets on the
 // phone while mouse layouts stay pixel-identical. Equal padding/negative margin
 // grows the hit area without moving neighbours where the row has room for it.
-const TOUCH_TALL = "[@media(pointer:coarse)]:min-h-[40px]";
+export const TOUCH_TALL = "[@media(pointer:coarse)]:min-h-[40px]"; // also used by the ⇄ panel (pages-main.jsx)
 const TOUCH_ICON = "[@media(pointer:coarse)]:min-w-[40px] [@media(pointer:coarse)]:py-3 [@media(pointer:coarse)]:-my-2";
 // Bordered chips can't grow visibly; an invisible ::after extends the tap area instead.
 // (8 px below stops just short of the section card, 10 px above is free space.)
@@ -114,6 +114,7 @@ export default function ActFromHere() {
   const latest = useRef(null);     // newest state, source of truth for writes AND mutations
   const storedRef = useRef(null);  // the afh2-v1 string this tab last read or wrote (see syncWithStored)
   const reconcileRef = useRef(null);
+  const restoreRef = useRef(null);
   const saveTimer = useRef(null);  // debounce handle
   const busy = useRef(false);      // a write is in flight
   const dirty = useRef(false);     // state changed while writing
@@ -199,10 +200,30 @@ export default function ActFromHere() {
       if (e.type === "storage" && e.key !== STORE_KEY) return;
       if (reconcileRef.current) reconcileRef.current();
     };
+    const onRestore = (e) => { if (restoreRef.current && e.detail) restoreRef.current(e.detail.data, e.detail.ids); };
     window.addEventListener("storage", onStored);
     window.addEventListener("afh:external", onStored);
-    return () => { window.removeEventListener("storage", onStored); window.removeEventListener("afh:external", onStored); };
+    window.addEventListener("afh:restore", onRestore);
+    return () => {
+      window.removeEventListener("storage", onStored);
+      window.removeEventListener("afh:external", onStored);
+      window.removeEventListener("afh:restore", onRestore);
+    };
   }, []);
+  // ⇄ history → "put back": the chosen items of a saved version go back onto the
+  // current state (restoreItems, never a whole-state restore), as an undoable edit.
+  restoreRef.current = (data, ids) => {
+    const st = cur();
+    if (!st || typeof data !== "string" || !Array.isArray(ids) || !ids.length) return;
+    let version;
+    try { version = migrate(JSON.parse(data)); } catch (e) { return; }
+    const next = restoreItems(st, version, ids);
+    if (next === st) { flash("nothing to put back — it's all here already"); return; }
+    const back = new Set(ids);
+    persist({ ...next, items: Object.fromEntries(Object.entries(next.items).map(([k, a]) => [k, a.map((it) => (back.has(it.id) ? { ...it, fresh: true } : it))])) });
+    unflashAll(1500);
+    offerUndo(st, `Put back ${ids.length} item${ids.length === 1 ? "" : "s"}`, undefined, ids);
+  };
 
   // ---------- save ----------
   // Writes are debounced + serialized: rapid taps coalesce into ONE storage.set.
